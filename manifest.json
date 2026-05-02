@@ -3,8 +3,8 @@
   "$id": "navidrome://plugins/manifest/tonus-sync",
   "name": "tonus-sync",
   "author": "madmax1301",
-  "version": "0.3.0",
-  "description": "Triggers tonus (FastAPI backend) on a schedule for automatic discovery + download per Navidrome user. Each configured user gets their own Discovery playlist owned by their Navidrome account, populated from their ListenBrainz top-artists via Deezer artist-radio.",
+  "version": "0.4.0",
+  "description": "Triggers tonus (FastAPI backend) on a schedule for automatic discovery + download per Navidrome user. Each configured user gets a default Discovery playlist (LB top-artists → Deezer artist-radio) plus optional Genre Mixes — weekly Spotify-style playlists per genre with configurable Wed/Fri discovery+build cycle. Genre Mixes use a fixed playlist (replace pattern) so users can copy favorites into their own playlists.",
   "website": "https://github.com/madmax1301/tonus-navidrome-plugin",
   "permissions": {
     "http": {
@@ -12,7 +12,7 @@
       "requiredHosts": ["*"]
     },
     "scheduler": {
-      "reason": "Registers a recurring cron job to trigger the tonus discovery pipeline (default: daily 07:00)."
+      "reason": "Registers a recurring cron job per discovery type — the global default-discovery (daily 07:00) plus one discovery+build pair per configured Genre Mix (Wed 02:00 / Fri 06:00 by default)."
     },
     "kvstore": {
       "reason": "Persists last-run status (timestamps, counts, last error) per Navidrome user.",
@@ -98,6 +98,114 @@
                 "title": "Playlist Name Template",
                 "description": "Subsonic playlist name. Placeholder {date} → YYYY-MM-DD, {user} → Navidrome username. Default: 'Discovery {date}'.",
                 "default": "Discovery {date}"
+              },
+              "mixes": {
+                "type": "array",
+                "title": "Genre Mixes",
+                "description": "Optional: Spotify-style weekly playlists per genre. Each mix has its own discovery cron (Wed 02:00 default, fills the download queue) + build cron (Fri 06:00 default, builds the Navidrome playlist). Build replaces the playlist content — favorites/custom playlists you've made elsewhere are unaffected.",
+                "items": {
+                  "type": "object",
+                  "required": ["name", "genre"],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "title": "Mix Name",
+                      "description": "Display name. Used as playlist title via the template below. Examples: 'Metalcore Weekly', 'Hip-Hop Discovery'."
+                    },
+                    "genre": {
+                      "type": "string",
+                      "title": "Genre",
+                      "description": "ListenBrainz genre tag. Cluster-sorted: Rock → Punk → Shoegaze → Metal → Hip-Hop → Electronic → Synth/Lo-Fi → Pop → Regional Pop → R&B → Folk → Jazz → Classical → World/Latin → Experimental.",
+                      "enum": [
+                        "rock", "alternative-rock", "indie-rock", "post-rock", "math-rock",
+                        "krautrock", "progressive-rock", "psychedelic-rock", "garage-rock",
+                        "surf-rock", "hard-rock", "classic-rock", "glam-rock",
+
+                        "punk", "punk-rock", "post-punk", "pop-punk", "ska-punk", "hardcore",
+                        "post-hardcore", "melodic-hardcore", "screamo", "emo", "midwest-emo",
+
+                        "shoegaze", "dream-pop", "slowcore",
+
+                        "metal", "metalcore", "deathcore", "melodic-death-metal", "death-metal",
+                        "black-metal", "doom-metal", "sludge-metal", "stoner-metal",
+                        "thrash-metal", "power-metal", "symphonic-metal", "folk-metal",
+                        "djent", "progressive-metal", "nu-metal", "mathcore", "grindcore",
+                        "post-metal",
+
+                        "hip-hop", "rap", "trap", "drill", "boom-bap", "conscious-hip-hop",
+                        "gangsta-rap", "mumble-rap", "cloud-rap", "phonk",
+                        "german-hip-hop", "uk-rap", "french-rap", "latin-rap",
+
+                        "electronic", "edm", "house", "deep-house", "tech-house",
+                        "techno", "minimal-techno", "trance", "psytrance",
+                        "drum-and-bass", "dubstep", "breakcore", "jungle", "footwork",
+                        "ambient", "idm", "glitch", "downtempo", "future-bass",
+                        "trip-hop", "big-beat", "electro", "breakbeat",
+
+                        "synthwave", "darkwave", "vaporwave", "retrowave", "future-funk",
+                        "lo-fi", "chillhop", "bedroom-pop",
+
+                        "pop", "indie-pop", "synth-pop", "electropop", "hyperpop",
+                        "dance-pop", "art-pop",
+
+                        "k-pop", "j-pop", "j-rock", "v-pop", "latin-pop", "mandopop",
+                        "c-pop", "k-indie",
+
+                        "r-and-b", "soul", "funk", "neo-soul", "disco", "motown",
+
+                        "folk", "indie-folk", "americana", "country", "singer-songwriter",
+                        "bluegrass", "alt-country", "folk-rock", "celtic-folk",
+
+                        "jazz", "smooth-jazz", "fusion", "swing", "big-band", "bebop",
+                        "latin-jazz", "free-jazz", "blues", "electric-blues",
+
+                        "classical", "soundtrack", "film-score", "video-game-music",
+                        "ambient-classical", "neoclassical", "modern-classical",
+
+                        "reggae", "dub", "dancehall", "ska", "afrobeat", "afro-pop",
+                        "amapiano", "mpb", "bossa-nova", "salsa", "cumbia",
+                        "reggaeton", "latin-trap",
+
+                        "experimental", "noise", "industrial", "post-industrial",
+                        "ebm", "witch-house", "dark-ambient", "drone"
+                      ]
+                    },
+                    "discovery_cron": {
+                      "type": "string",
+                      "title": "Discovery Cron",
+                      "description": "When to fetch new tracks for this mix and queue missing ones for download. Default: Wednesday 02:00 — gives the queue 48h before the build cron picks them up.",
+                      "default": "0 2 * * 3"
+                    },
+                    "build_cron": {
+                      "type": "string",
+                      "title": "Build Cron",
+                      "description": "When to build the Subsonic playlist from the discovered (and meanwhile downloaded) tracks. Default: Friday 06:00.",
+                      "default": "0 6 * * 5"
+                    },
+                    "count": {
+                      "type": "integer",
+                      "title": "Tracks per Mix",
+                      "description": "How many tracks the final playlist should contain. Discovery may fetch more candidates internally before deduping against the library.",
+                      "minimum": 5,
+                      "maximum": 100,
+                      "default": 25
+                    },
+                    "discovery_ratio": {
+                      "type": "number",
+                      "title": "Discovery Ratio",
+                      "description": "0.0 = all familiar (your library), 1.0 = all new discoveries. Default 0.4 = 40% new / 60% familiar — Spotify-style mix.",
+                      "minimum": 0,
+                      "maximum": 1,
+                      "default": 0.4
+                    },
+                    "playlist_template": {
+                      "type": "string",
+                      "title": "Playlist Name Template",
+                      "description": "Subsonic playlist name. Placeholders: {name} → mix name, {genre} → genre tag, {user} → Navidrome username, {date} → YYYY-MM-DD (only used on first build, kept after that since playlist is replaced in-place).",
+                      "default": "{name}"
+                    }
+                  }
+                }
               }
             }
           }
@@ -149,7 +257,36 @@
                   "elements": [
                     { "type": "Control", "scope": "#/properties/navidrome_username" },
                     { "type": "Control", "scope": "#/properties/listenbrainz_username" },
-                    { "type": "Control", "scope": "#/properties/playlist_name" }
+                    { "type": "Control", "scope": "#/properties/playlist_name" },
+                    {
+                      "type": "Control",
+                      "scope": "#/properties/mixes",
+                      "options": {
+                        "elementLabelProp": "name",
+                        "detail": {
+                          "type": "VerticalLayout",
+                          "elements": [
+                            { "type": "Control", "scope": "#/properties/name" },
+                            { "type": "Control", "scope": "#/properties/genre" },
+                            {
+                              "type": "HorizontalLayout",
+                              "elements": [
+                                { "type": "Control", "scope": "#/properties/discovery_cron" },
+                                { "type": "Control", "scope": "#/properties/build_cron" }
+                              ]
+                            },
+                            {
+                              "type": "HorizontalLayout",
+                              "elements": [
+                                { "type": "Control", "scope": "#/properties/count" },
+                                { "type": "Control", "scope": "#/properties/discovery_ratio" }
+                              ]
+                            },
+                            { "type": "Control", "scope": "#/properties/playlist_template" }
+                          ]
+                        }
+                      }
+                    }
                   ]
                 }
               }
