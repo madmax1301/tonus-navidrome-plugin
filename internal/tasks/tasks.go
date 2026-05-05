@@ -2,12 +2,20 @@
 // TaskQueue. The cron-callback enqueues one job per Navidrome user per
 // run; the OnTaskExecute hook deserializes and dispatches them.
 //
-// Two job types:
+// Four job types:
 //   - JobTriggerSync   → POST /api/plugin/sync for one user (fire-and-forget)
 //   - JobReconcile     → query /api/plugin/finished-tracks + push to Subsonic
+//   - JobMixDiscovery  → POST /api/plugin/mix/discovery for one (user, mix) —
+//                        gets the in-library "existing" list back, persists it
+//                        in KVStore for the build phase, queues missing tracks
+//                        for download in the background
+//   - JobMixBuild      → reads KVStore "existing" + queries finished-tracks for
+//                        the same (user, mix), then replaces the user's Subsonic
+//                        playlist content with the merged result (Spotify-style
+//                        weekly mix with stable playlist ID)
 //
-// They run in the same TaskQueue (concurrency 1) so per-user runs never
-// overlap and the playlist-update is idempotent regardless of order.
+// All four run in the same TaskQueue (concurrency 1) so per-user runs never
+// overlap and Subsonic playlist updates are well-ordered.
 package tasks
 
 import (
@@ -30,8 +38,10 @@ const QueueName = "tonus-sync"
 type JobType string
 
 const (
-	JobTriggerSync JobType = "trigger-sync"
-	JobReconcile   JobType = "reconcile"
+	JobTriggerSync  JobType = "trigger-sync"
+	JobReconcile    JobType = "reconcile"
+	JobMixDiscovery JobType = "mix-discovery"
+	JobMixBuild     JobType = "mix-build"
 )
 
 // Job is the canonical payload format. Marshal → bytes → host.TaskEnqueue
@@ -46,10 +56,19 @@ type Job struct {
 	TonusURL   string `json:"tonus_url"`
 	TonusToken string `json:"tonus_token"`
 
-	// Discovery tuning.
+	// Discovery tuning (used by JobTriggerSync).
 	TopArtists      int `json:"top_artists"`
 	TracksPerArtist int `json:"tracks_per_artist"`
 	MaxQueuePerRun  int `json:"max_queue_per_run"`
+
+	// Mix-specific (used by JobMixDiscovery + JobMixBuild). Empty for the
+	// classic discovery jobs above. Set in OnCallback when the schedule key
+	// belongs to a per-(user, mix) cron.
+	MixName             string  `json:"mix_name,omitempty"`
+	MixGenre            string  `json:"mix_genre,omitempty"`
+	MixCount            int     `json:"mix_count,omitempty"`
+	MixDiscoveryRatio   float64 `json:"mix_discovery_ratio,omitempty"`
+	MixPlaylistTemplate string  `json:"mix_playlist_template,omitempty"`
 }
 
 // Marshal returns the task payload bytes for host.TaskEnqueue.
@@ -68,6 +87,10 @@ func (j *Job) Dispatch() (string, error) {
 		return runTriggerSync(j)
 	case JobReconcile:
 		return runReconcile(j)
+	case JobMixDiscovery:
+		return runMixDiscovery(j)
+	case JobMixBuild:
+		return runMixBuild(j)
 	default:
 		return fmt.Sprintf("unknown job type %q", j.Type), nil
 	}

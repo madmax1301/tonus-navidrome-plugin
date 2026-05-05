@@ -388,3 +388,73 @@ func (c *Client) FinishedTracks(navidromeUser string, sinceDays int, playlistNam
 	}
 	return out, nil
 }
+
+// FinishedTracksByMix queries the backend for tracks of a given (user, mix)
+// — i.e. only items that were queued by an earlier mix-discovery run with
+// the matching plugin_mix_name marker in their payload.
+//
+// Backend MAY not yet support the mix_name filter (Plugin-Side PR ahead of
+// Backend-Side PR 3.5). In that case the call still works but returns all
+// of the user's finished tracks; the caller should be tolerant of extra
+// items in the response.
+func (c *Client) FinishedTracksByMix(navidromeUser, mixName string, sinceDays int) (*FinishedTracksResponse, error) {
+	if sinceDays <= 0 {
+		sinceDays = 14
+	}
+	q := url.Values{}
+	q.Set("navidrome_user", navidromeUser)
+	q.Set("mix_name", mixName)
+	q.Set("since_days", fmt.Sprintf("%d", sinceDays))
+	out := &FinishedTracksResponse{}
+	if err := c.request("GET", "/api/plugin/finished-tracks?"+q.Encode(), nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ---- Mix Discovery -------------------------------------------------------
+
+// MixDiscoveryRequest mirrors backend `PluginMixDiscoveryRequest`. The mix
+// is identified by (NavidromeUser, MixName); Genre drives the LB/MB
+// tag-search; Count caps the final playlist size; DiscoveryRatio decides
+// the new-vs-familiar split (0.4 = 40% new / 60% familiar by default).
+type MixDiscoveryRequest struct {
+	NavidromeUser  string  `json:"navidrome_user"`
+	MixName        string  `json:"mix_name"`
+	Genre          string  `json:"genre"`
+	Count          int     `json:"count"`
+	DiscoveryRatio float64 `json:"discovery_ratio"`
+}
+
+// MixExisting mirrors the entries in MixDiscoveryResponse.Existing[].
+// SubsonicID is server-side-resolved so the build phase doesn't need
+// another search3 call to attach these to a playlist.
+type MixExisting struct {
+	SubsonicID string `json:"subsonic_id"`
+	Artist     string `json:"artist"`
+	Title      string `json:"title"`
+}
+
+// MixDiscoveryResponse is what /api/plugin/mix/discovery returns: the
+// in-library "existing" tracks (synchronous), plus a flag that the
+// background queueing of missing tracks has started.
+type MixDiscoveryResponse struct {
+	Started  bool          `json:"started"`
+	Message  string        `json:"message"`
+	Existing []MixExisting `json:"existing"`
+}
+
+// MixDiscovery fires the backend's POST /api/plugin/mix/discovery.
+// Synchronous part (existing-list) returns within seconds; missing-track
+// queueing happens in the backend's BackgroundTasks.
+func (c *Client) MixDiscovery(req MixDiscoveryRequest) (*MixDiscoveryResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal mix-discovery: %w", err)
+	}
+	out := &MixDiscoveryResponse{}
+	if err := c.request("POST", "/api/plugin/mix/discovery", body, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}

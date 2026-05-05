@@ -18,3 +18,5 @@ coverage.txt
 # Local-only secrets / configs
 .env
 .env.local
+
+CLAUDE.md
