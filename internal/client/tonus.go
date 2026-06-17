@@ -33,29 +33,14 @@ type HealthResponse struct {
 	NowMs        int64  `json:"now_ms"`
 }
 
-// TrackHint mirrors what the tonus backend includes per item in the
-// /api/plugin/library/missing response. We pass it back unchanged on the
-// /api/download POST so the queue UI can display cover art etc. immediately,
-// without waiting for the metadata fetch.
+// TrackHint is passed to /api/download so the queue UI can display cover art
+// etc. immediately, without waiting for the metadata fetch.
 type TrackHint struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Artist   string `json:"artist"`
 	Album    string `json:"album"`
 	AlbumArt string `json:"album_art,omitempty"`
-}
-
-type MissingItem struct {
-	Artist    string    `json:"artist"`
-	Title     string    `json:"title"`
-	TrackID   string    `json:"track_id"`
-	TrackHint TrackHint `json:"track_hint"`
-}
-
-type LibraryMissingResponse struct {
-	Items  []MissingItem `json:"items"`
-	Count  int           `json:"count"`
-	Source string        `json:"source"`
 }
 
 // DownloadResponse covers the success case of POST /api/download. The 409
@@ -169,19 +154,6 @@ func (c *Client) Health() (*HealthResponse, error) {
 	return out, nil
 }
 
-func (c *Client) LibraryMissing(lbUser string, topN, perArtist, maxTotal int) (*LibraryMissingResponse, error) {
-	q := url.Values{}
-	q.Set("listenbrainz_user", lbUser)
-	q.Set("top_artists", fmt.Sprintf("%d", topN))
-	q.Set("tracks_per_artist", fmt.Sprintf("%d", perArtist))
-	q.Set("max_total", fmt.Sprintf("%d", maxTotal))
-	out := &LibraryMissingResponse{}
-	if err := c.request("GET", "/api/plugin/library/missing?"+q.Encode(), nil, out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *Client) ImportCSV(csvText, provider string, limit int) (*CSVImportResponse, error) {
 	if provider == "" {
 		provider = "deezer"
@@ -238,21 +210,6 @@ func (c *Client) SyncStatus() (*SyncStatusResponse, error) {
 	return out, nil
 }
 
-// TriggerSyncRequest mirrors backend `PluginSyncRequest`. PlaylistName + NavidromeUser
-// are optional; if NavidromeUser is set, finished tracks become discoverable via
-// /api/plugin/finished-tracks for plugin-side per-user playlist creation.
-// PlaylistName supports the {date} placeholder — backend substitutes it before use.
-type TriggerSyncRequest struct {
-	ListenBrainzUser string `json:"listenbrainz_user"`
-	TopArtists       int    `json:"top_artists"`
-	TracksPerArtist  int    `json:"tracks_per_artist"`
-	HistoryDays      int    `json:"history_days,omitempty"`
-	MaxTotal         int    `json:"max_total"`
-	Location         string `json:"location,omitempty"`
-	PlaylistName     string `json:"playlist_name,omitempty"`
-	NavidromeUser    string `json:"navidrome_user,omitempty"`
-}
-
 // FinishedTrack mirrors backend `/api/plugin/finished-tracks` items. The
 // SubsonicTrackID is resolved server-side (admin-auth search3) and cached in
 // the job payload — when present, the plugin can skip its own search3 call.
@@ -270,26 +227,6 @@ type FinishedTracksResponse struct {
 	Count          int             `json:"count"`
 	NavidromeUser  string          `json:"navidrome_user"`
 	SinceDays      int             `json:"since_days"`
-}
-
-type TriggerSyncResponse struct {
-	Started bool   `json:"started"`
-	Message string `json:"message"`
-}
-
-// TriggerSync fires the backend's POST /api/plugin/sync. Backend runs the
-// discovery+queue pipeline asynchronously and returns 200 immediately —
-// keeping us inside Navidrome's plugin-callback timeout.
-func (c *Client) TriggerSync(req TriggerSyncRequest) (*TriggerSyncResponse, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal sync trigger: %w", err)
-	}
-	out := &TriggerSyncResponse{}
-	if err := c.request("POST", "/api/plugin/sync", body, out); err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 // DownloadOutcome describes the result of a single Download call. We don't

@@ -1,25 +1,25 @@
-// tonus-navidrome-plugin: Navidrome plugin that triggers the tonus
-// FastAPI backend for per-user discovery + automated playlist creation.
+// tonus-navidrome-plugin: Navidrome plugin that mirrors ListenBrainz Weekly
+// playlists and builds genre-mix playlists for Navidrome users.
 //
 // Architecture:
-//   1. OnInit registers the cron and creates the TaskQueue. No work yet.
+//   1. OnInit registers the global cron ("tonus-sync") and per-(user,mix)
+//      crons, and creates the TaskQueue. No work yet.
 //   2. OnCallback (every cron tick) reads the config (tonus URL/token,
-//      schedule, global discovery tuning, the user-mapping array) and enqueues
-//      one trigger-sync task + one reconcile task per configured user. Returns
-//      in <1s — well below the plugin-callback timeout.
-//   3. OnTaskExecute runs each task asynchronously. trigger-sync hits
-//      /api/plugin/sync. reconcile pulls /api/plugin/finished-tracks and
-//      pushes the matched Subsonic IDs into the user-owned playlist via
-//      host.SubsonicAPICall (which authenticates as that user automatically
-//      thanks to the `users` permission).
+//      schedule, user-mapping array) and enqueues jobs. For the global cron
+//      it enqueues one (Discovery + Reconcile) pair per LB-Weekly slot per
+//      user with LbWeeklyMirror==true. Returns in <1s — well below the
+//      plugin-callback timeout.
+//   3. OnTaskExecute runs each task asynchronously. LbWeeklyDiscovery hits
+//      /api/plugin/lbweekly/discovery. Reconcile pulls
+//      /api/plugin/finished-tracks and pushes the matched Subsonic IDs into
+//      the user-owned playlist via host.SubsonicAPICall (which authenticates
+//      as that user automatically thanks to the `users` permission).
 package main
 
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/host"
 	"github.com/navidrome/navidrome/plugins/pdk/go/lifecycle"
@@ -43,11 +43,7 @@ const (
 
 // Defaults mirror the JSON-Schema defaults; used when a key is set-but-empty.
 const (
-	defaultCron            = "0 7 * * *"
-	defaultTopArtists      = 10
-	defaultTracksPerArtist = 5
-	defaultMaxQueuePerRun  = 30
-	defaultPlaylistTpl     = "Discovery {date}"
+	defaultCron             = "0 7 * * *"
 	defaultMixDiscoveryCron = "0 2 * * 3"
 	defaultMixBuildCron     = "0 6 * * 5"
 	defaultMixCount         = 25
@@ -78,18 +74,6 @@ type userMapping struct {
 	LbWeeklyMirror       bool        `json:"lb_weekly_mirror"`
 }
 
-func getInt(key string, fallback int) int {
-	raw, ok := pdk.GetConfig(key)
-	if !ok || raw == "" {
-		return fallback
-	}
-	v, err := strconv.Atoi(raw)
-	if err != nil || v <= 0 {
-		return fallback
-	}
-	return v
-}
-
 func loadUsers() ([]userMapping, error) {
 	raw, ok := pdk.GetConfig("users")
 	if !ok || raw == "" {
@@ -103,19 +87,6 @@ func loadUsers() ([]userMapping, error) {
 		return nil, fmt.Errorf("`users` array is empty")
 	}
 	return out, nil
-}
-
-// substituteTemplate replaces {date} → YYYY-MM-DD and {user} → navidromeUser.
-// Done at enqueue-time (in OnCallback) so each task carries the resolved name
-// — keeps the Reconcile-Task deterministic across multiple run-attempts.
-func substituteTemplate(tpl, navidromeUser string) string {
-	if tpl == "" {
-		return ""
-	}
-	out := tpl
-	out = strings.ReplaceAll(out, "{date}", time.Now().Format("2006-01-02"))
-	out = strings.ReplaceAll(out, "{user}", navidromeUser)
-	return out
 }
 
 // OnInit registers the cron and creates the task queue. We don't validate
@@ -265,69 +236,58 @@ func (p *plugin) OnCallback(req scheduler.SchedulerCallbackRequest) error {
 		return nil
 	}
 
-	topArtists := getInt("top_artists", defaultTopArtists)
-	tracksPerArtist := getInt("tracks_per_artist", defaultTracksPerArtist)
-	maxQueue := getInt("max_queue_per_run", defaultMaxQueuePerRun)
-
-	enqueuedTrigger := 0
+	enqueuedDiscovery := 0
 	enqueuedReconcile := 0
 
 	for _, u := range users {
-		if u.NavidromeUsername == "" || u.ListenBrainzUsername == "" {
-			pdk.Log(pdk.LogWarn, fmt.Sprintf(
-				"tonus-sync: skipping user mapping with missing fields (nd=%q, lb=%q)",
-				u.NavidromeUsername, u.ListenBrainzUsername,
-			))
+		if u.NavidromeUsername == "" || !u.LbWeeklyMirror {
 			continue
 		}
-		playlistTpl := u.PlaylistName
-		if playlistTpl == "" {
-			playlistTpl = defaultPlaylistTpl
-		}
-		resolvedPlaylist := substituteTemplate(playlistTpl, u.NavidromeUsername)
-
-		base := tasks.Job{
-			NavidromeUser:    u.NavidromeUsername,
-			ListenBrainzUser: u.ListenBrainzUsername,
-			PlaylistName:     resolvedPlaylist,
-			TonusURL:       tonusURL,
-			TonusToken:     tonusToken,
-			TopArtists:       topArtists,
-			TracksPerArtist:  tracksPerArtist,
-			MaxQueuePerRun:   maxQueue,
-		}
-
-		// 1) Trigger-task → backend kicks off discovery + download for this user.
-		trigger := base
-		trigger.Type = tasks.JobTriggerSync
-		if payload, err := trigger.Marshal(); err == nil {
-			if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
-				pdk.Log(pdk.LogError, fmt.Sprintf(
-					"enqueue trigger %q: %s", u.NavidromeUsername, err.Error(),
-				))
-			} else {
-				enqueuedTrigger++
+		for _, slot := range tasks.LbWeeklySlots {
+			base := tasks.Job{
+				NavidromeUser:    u.NavidromeUsername,
+				ListenBrainzUser: u.ListenBrainzUsername,
+				PlaylistName:     slot.PlaylistName,
+				LbSourcePatch:    slot.SourcePatch,
+				LbOccurrence:     slot.Occurrence,
+				TonusURL:         tonusURL,
+				TonusToken:       tonusToken,
 			}
-		}
 
-		// 2) Reconcile-task → pull finished tracks + push to user playlist.
-		// Catches tracks from earlier runs that finished in the meantime.
-		reconcile := base
-		reconcile.Type = tasks.JobReconcile
-		if payload, err := reconcile.Marshal(); err == nil {
-			if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
-				pdk.Log(pdk.LogError, fmt.Sprintf(
-					"enqueue reconcile %q: %s", u.NavidromeUsername, err.Error(),
-				))
-			} else {
-				enqueuedReconcile++
+			// 1) Discovery → backend queues missing LB-Weekly tracks for download.
+			disc := base
+			disc.Type = tasks.JobLbWeeklyDiscovery
+			if payload, err := disc.Marshal(); err == nil {
+				if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
+					pdk.Log(pdk.LogError, fmt.Sprintf(
+						"enqueue lbweekly-discovery %q/%q: %s",
+						u.NavidromeUsername, slot.PlaylistName, err.Error(),
+					))
+				} else {
+					enqueuedDiscovery++
+				}
+			}
+
+			// 2) Reconcile → pull finished tracks + push to user playlist.
+			// Catches tracks from earlier runs that finished in the meantime.
+			rec := base
+			rec.Type = tasks.JobReconcile
+			if payload, err := rec.Marshal(); err == nil {
+				if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
+					pdk.Log(pdk.LogError, fmt.Sprintf(
+						"enqueue reconcile %q/%q: %s",
+						u.NavidromeUsername, slot.PlaylistName, err.Error(),
+					))
+				} else {
+					enqueuedReconcile++
+				}
 			}
 		}
 	}
 
 	pdk.Log(pdk.LogInfo, fmt.Sprintf(
-		"tonus-sync: enqueued %d trigger + %d reconcile tasks (users=%d)",
-		enqueuedTrigger, enqueuedReconcile, len(users),
+		"tonus-sync: enqueued %d lbweekly-discovery + %d reconcile tasks (users=%d)",
+		enqueuedDiscovery, enqueuedReconcile, len(users),
 	))
 	return nil
 }

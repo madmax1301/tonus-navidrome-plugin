@@ -1,9 +1,8 @@
 // Package tasks defines the asynchronous job format for the plugin's
-// TaskQueue. The cron-callback enqueues one job per Navidrome user per
-// run; the OnTaskExecute hook deserializes and dispatches them.
+// TaskQueue. The cron-callback enqueues jobs per Navidrome user per run;
+// the OnTaskExecute hook deserializes and dispatches them.
 //
 // Job types:
-//   - JobTriggerSync       → POST /api/plugin/sync for one user (fire-and-forget)
 //   - JobReconcile         → query /api/plugin/finished-tracks + push to Subsonic
 //   - JobMixDiscovery      → POST /api/plugin/mix/discovery for one (user, mix) —
 //                            gets the in-library "existing" list back, persists it
@@ -41,7 +40,6 @@ const QueueName = "tonus-sync"
 type JobType string
 
 const (
-	JobTriggerSync       JobType = "trigger-sync"
 	JobReconcile         JobType = "reconcile"
 	JobMixDiscovery      JobType = "mix-discovery"
 	JobMixBuild          JobType = "mix-build"
@@ -75,13 +73,8 @@ type Job struct {
 	TonusURL   string `json:"tonus_url"`
 	TonusToken string `json:"tonus_token"`
 
-	// Discovery tuning (used by JobTriggerSync).
-	TopArtists      int `json:"top_artists"`
-	TracksPerArtist int `json:"tracks_per_artist"`
-	MaxQueuePerRun  int `json:"max_queue_per_run"`
-
-	// Mix-specific (used by JobMixDiscovery + JobMixBuild). Empty for the
-	// classic discovery jobs above. Set in OnCallback when the schedule key
+	// Mix-specific (used by JobMixDiscovery + JobMixBuild). Empty for
+	// reconcile/lbweekly jobs. Set in OnCallback when the schedule key
 	// belongs to a per-(user, mix) cron.
 	MixName             string  `json:"mix_name,omitempty"`
 	MixGenre            string  `json:"mix_genre,omitempty"`
@@ -106,8 +99,6 @@ func (j *Job) Marshal() ([]byte, error) {
 //   - both empty       → success
 func (j *Job) Dispatch() (string, error) {
 	switch j.Type {
-	case JobTriggerSync:
-		return runTriggerSync(j)
 	case JobReconcile:
 		return runReconcile(j)
 	case JobMixDiscovery:
@@ -119,47 +110,6 @@ func (j *Job) Dispatch() (string, error) {
 	default:
 		return fmt.Sprintf("unknown job type %q", j.Type), nil
 	}
-}
-
-// ---- TriggerSync ---------------------------------------------------------
-
-func runTriggerSync(j *Job) (string, error) {
-	cl := client.New(j.TonusURL, j.TonusToken)
-
-	// Health-Check first so config errors surface immediately, not 24h later.
-	h, err := cl.Health()
-	if err != nil {
-		return "", fmt.Errorf("trigger-sync %q: health: %w", j.NavidromeUser, err)
-	}
-	if h.AuthRequired && j.TonusToken == "" {
-		return fmt.Sprintf("trigger-sync %q: backend requires token but none configured", j.NavidromeUser), nil
-	}
-
-	resp, err := cl.TriggerSync(client.TriggerSyncRequest{
-		ListenBrainzUser: j.ListenBrainzUser,
-		TopArtists:       j.TopArtists,
-		TracksPerArtist:  j.TracksPerArtist,
-		MaxTotal:         j.MaxQueuePerRun,
-		Location:         "navidrome",
-		PlaylistName:     j.PlaylistName,
-		NavidromeUser:    j.NavidromeUser,
-	})
-	if err != nil {
-		return "", fmt.Errorf("trigger-sync %q: %w", j.NavidromeUser, err)
-	}
-
-	pdk.Log(pdk.LogInfo, fmt.Sprintf(
-		"trigger-sync %q (lb=%s) accepted: started=%v %s",
-		j.NavidromeUser, j.ListenBrainzUser, resp.Started, resp.Message,
-	))
-	writeUserStatus(j.NavidromeUser, userStatus{
-		LastTriggerMs:    time.Now().UnixMilli(),
-		LastTriggerOK:    true,
-		LastTriggerInfo:  fmt.Sprintf("backend ack: %s", resp.Message),
-		ListenBrainzUser: j.ListenBrainzUser,
-		PlaylistName:     j.PlaylistName,
-	})
-	return "", nil
 }
 
 // ---- Reconcile -----------------------------------------------------------
