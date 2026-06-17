@@ -69,7 +69,6 @@ type mixConfig struct {
 type userMapping struct {
 	NavidromeUsername    string      `json:"navidrome_username"`
 	ListenBrainzUsername string      `json:"listenbrainz_username"`
-	PlaylistName         string      `json:"playlist_name"`
 	Mixes                []mixConfig `json:"mixes,omitempty"`
 	LbWeeklyMirror       bool        `json:"lb_weekly_mirror"`
 }

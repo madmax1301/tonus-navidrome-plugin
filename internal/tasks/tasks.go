@@ -112,6 +112,15 @@ func (j *Job) Dispatch() (string, error) {
 	}
 }
 
+// lbWeeklyExistingTrack is a local mirror of client.LbWeeklyExistingTrack used
+// to unmarshal the KVStore-persisted existing-list without a circular import.
+// Must stay in sync with client.LbWeeklyExistingTrack (json tags are canonical).
+type lbWeeklyExistingTrack struct {
+	SubsonicID string `json:"subsonic_id"`
+	Artist     string `json:"artist"`
+	Title      string `json:"title"`
+}
+
 // ---- Reconcile -----------------------------------------------------------
 
 func runReconcile(j *Job) (string, error) {
@@ -121,6 +130,26 @@ func runReconcile(j *Job) (string, error) {
 	}
 	cl := client.New(j.TonusURL, j.TonusToken)
 
+	// 0. Read the LB-Weekly existing-list from KVStore (persisted by
+	// runLbWeeklyDiscovery). Must happen BEFORE the finished.Count==0 check
+	// so that a playlist consisting entirely of in-library tracks still gets
+	// built even when no downloads finished yet.
+	var existingTracks []lbWeeklyExistingTrack
+	kvKey := fmt.Sprintf("lbweekly:%s:%s", j.NavidromeUser, j.PlaylistName)
+	if kvBytes, ok, kvErr := host.KVStoreGet(kvKey); kvErr != nil {
+		pdk.Log(pdk.LogWarn, fmt.Sprintf(
+			"reconcile %q/%q: KVStoreGet %s failed (continuing without existing): %s",
+			j.NavidromeUser, j.PlaylistName, kvKey, kvErr.Error(),
+		))
+	} else if ok && len(kvBytes) > 0 {
+		if err := json.Unmarshal(kvBytes, &existingTracks); err != nil {
+			pdk.Log(pdk.LogWarn, fmt.Sprintf(
+				"reconcile %q/%q: parse KV %s: %s",
+				j.NavidromeUser, j.PlaylistName, kvKey, err.Error(),
+			))
+		}
+	}
+
 	// 1. Pull a small batch of finished tracks (limit=25 keeps backend
 	// search3-resolution + plugin Subsonic-write under the 30s task timeout).
 	// Remaining tracks come along on subsequent cron triggers.
@@ -128,8 +157,8 @@ func runReconcile(j *Job) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("reconcile %q: finished-tracks: %w", j.NavidromeUser, err)
 	}
-	if finished.Count == 0 {
-		pdk.Log(pdk.LogDebug, fmt.Sprintf("reconcile %q: no finished tracks yet", j.NavidromeUser))
+	if finished.Count == 0 && len(existingTracks) == 0 {
+		pdk.Log(pdk.LogDebug, fmt.Sprintf("reconcile %q: no finished tracks and no existing tracks yet", j.NavidromeUser))
 		return "", nil
 	}
 
@@ -151,11 +180,26 @@ func runReconcile(j *Job) (string, error) {
 		))
 	}
 
-	// 4. Backend already resolved Subsonic-IDs serverside (admin-auth search3,
+	// 4. Build the deduplicated song-ID list: existing in-library tracks first,
+	// then finished (downloaded) tracks. Existing IDs are already resolved
+	// server-side; finished tracks fall back to a search3 call if needed.
+	seen := make(map[string]struct{}, len(existingTracks)+finished.Count)
+	songIDs := make([]string, 0, len(existingTracks)+finished.Count)
+	for _, e := range existingTracks {
+		if e.SubsonicID == "" {
+			continue
+		}
+		if _, dup := seen[e.SubsonicID]; dup {
+			continue
+		}
+		seen[e.SubsonicID] = struct{}{}
+		songIDs = append(songIDs, e.SubsonicID)
+	}
+
+	// 5. Backend already resolved Subsonic-IDs serverside (admin-auth search3,
 	// cached in payload). For the rare case where backend couldn't resolve
 	// (Subsonic indexer not yet caught up at queue-time) we fall back to a
 	// single search3 call here. Misses are retried on the next cron tick.
-	songIDs := make([]string, 0, finished.Count)
 	unresolved := 0
 	for _, ft := range finished.Items {
 		sid := ft.SubsonicTrackID
@@ -174,6 +218,10 @@ func runReconcile(j *Job) (string, error) {
 			unresolved++
 			continue
 		}
+		if _, dup := seen[sid]; dup {
+			continue
+		}
+		seen[sid] = struct{}{}
 		songIDs = append(songIDs, sid)
 	}
 
@@ -183,8 +231,8 @@ func runReconcile(j *Job) (string, error) {
 	}
 
 	pdk.Log(pdk.LogInfo, fmt.Sprintf(
-		"reconcile %q: playlist=%q +%d tracks (already in playlist: %d, unresolved: %d, total finished: %d)",
-		j.NavidromeUser, pl.Name, added, len(songIDs)-added, unresolved, finished.Count,
+		"reconcile %q: playlist=%q +%d tracks (already in playlist: %d, existing: %d, unresolved: %d, total finished: %d)",
+		j.NavidromeUser, pl.Name, added, len(songIDs)-added, len(existingTracks), unresolved, finished.Count,
 	))
 	writeUserStatus(j.NavidromeUser, userStatus{
 		LastReconcileMs:        time.Now().UnixMilli(),

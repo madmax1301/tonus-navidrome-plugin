@@ -50,10 +50,10 @@ func runLbWeeklyDiscovery(j *Job) (string, error) {
 	// Persist the existing-list for the build phase. Exact pattern from
 	// runMixDiscovery (mix.go): json.Marshal + host.KVStoreSet.
 	kvKey := fmt.Sprintf("lbweekly:%s:%s", j.NavidromeUser, j.PlaylistName)
-	if data, mErr := json.Marshal(resp.Existing); mErr == nil {
-		if err := host.KVStoreSet(kvKey, data); err != nil {
-			pdk.Log(pdk.LogWarn, fmt.Sprintf("lbweekly KVStoreSet %s: %s", kvKey, err.Error()))
-		}
+	if data, mErr := json.Marshal(resp.Existing); mErr != nil {
+		pdk.Log(pdk.LogWarn, fmt.Sprintf("lbweekly marshal existing %s: %s", kvKey, mErr.Error()))
+	} else if err := host.KVStoreSet(kvKey, data); err != nil {
+		pdk.Log(pdk.LogWarn, fmt.Sprintf("lbweekly KVStoreSet %s: %s", kvKey, err.Error()))
 	}
 
 	pdk.Log(pdk.LogInfo, fmt.Sprintf(
