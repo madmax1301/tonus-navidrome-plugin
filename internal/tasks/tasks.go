@@ -2,19 +2,22 @@
 // TaskQueue. The cron-callback enqueues one job per Navidrome user per
 // run; the OnTaskExecute hook deserializes and dispatches them.
 //
-// Four job types:
-//   - JobTriggerSync   → POST /api/plugin/sync for one user (fire-and-forget)
-//   - JobReconcile     → query /api/plugin/finished-tracks + push to Subsonic
-//   - JobMixDiscovery  → POST /api/plugin/mix/discovery for one (user, mix) —
-//                        gets the in-library "existing" list back, persists it
-//                        in KVStore for the build phase, queues missing tracks
-//                        for download in the background
-//   - JobMixBuild      → reads KVStore "existing" + queries finished-tracks for
-//                        the same (user, mix), then replaces the user's Subsonic
-//                        playlist content with the merged result (Spotify-style
-//                        weekly mix with stable playlist ID)
+// Job types:
+//   - JobTriggerSync       → POST /api/plugin/sync for one user (fire-and-forget)
+//   - JobReconcile         → query /api/plugin/finished-tracks + push to Subsonic
+//   - JobMixDiscovery      → POST /api/plugin/mix/discovery for one (user, mix) —
+//                            gets the in-library "existing" list back, persists it
+//                            in KVStore for the build phase, queues missing tracks
+//                            for download in the background
+//   - JobMixBuild          → reads KVStore "existing" + queries finished-tracks for
+//                            the same (user, mix), then replaces the user's Subsonic
+//                            playlist content with the merged result (Spotify-style
+//                            weekly mix with stable playlist ID)
+//   - JobLbWeeklyDiscovery → POST /api/plugin/lbweekly/discovery for one (user,
+//                            slot) — gets the in-library "existing" list back,
+//                            persists it in KVStore; build phase reuses runReconcile
 //
-// All four run in the same TaskQueue (concurrency 1) so per-user runs never
+// All jobs run in the same TaskQueue (concurrency 1) so per-user runs never
 // overlap and Subsonic playlist updates are well-ordered.
 package tasks
 
@@ -38,11 +41,27 @@ const QueueName = "tonus-sync"
 type JobType string
 
 const (
-	JobTriggerSync  JobType = "trigger-sync"
-	JobReconcile    JobType = "reconcile"
-	JobMixDiscovery JobType = "mix-discovery"
-	JobMixBuild     JobType = "mix-build"
+	JobTriggerSync       JobType = "trigger-sync"
+	JobReconcile         JobType = "reconcile"
+	JobMixDiscovery      JobType = "mix-discovery"
+	JobMixBuild          JobType = "mix-build"
+	JobLbWeeklyDiscovery JobType = "lbweekly-discovery"
 )
+
+// LbWeeklySlot describes one of the four mirrored LB playlists.
+type LbWeeklySlot struct {
+	PlaylistName string // Navidrome-side name
+	SourcePatch  string // LB source_patch parameter
+	Occurrence   int    // 0 = current week, 1 = previous week
+}
+
+// LbWeeklySlots — fixed order, mirrored per user.
+var LbWeeklySlots = []LbWeeklySlot{
+	{"Weekly Exploration", "weekly-exploration", 0},
+	{"Weekly Jams", "weekly-jams", 0},
+	{"Last Week's Exploration", "weekly-exploration", 1},
+	{"Last Week's Jams", "weekly-jams", 1},
+}
 
 // Job is the canonical payload format. Marshal → bytes → host.TaskEnqueue
 // in main.go; OnTaskExecute does Unmarshal → Dispatch.
@@ -69,6 +88,10 @@ type Job struct {
 	MixCount            int     `json:"mix_count,omitempty"`
 	MixDiscoveryRatio   float64 `json:"mix_discovery_ratio,omitempty"`
 	MixPlaylistTemplate string  `json:"mix_playlist_template,omitempty"`
+
+	// LB-Weekly-specific (used by JobLbWeeklyDiscovery).
+	LbSourcePatch string `json:"lb_source_patch,omitempty"`
+	LbOccurrence  int    `json:"lb_occurrence,omitempty"`
 }
 
 // Marshal returns the task payload bytes for host.TaskEnqueue.
@@ -91,6 +114,8 @@ func (j *Job) Dispatch() (string, error) {
 		return runMixDiscovery(j)
 	case JobMixBuild:
 		return runMixBuild(j)
+	case JobLbWeeklyDiscovery:
+		return runLbWeeklyDiscovery(j)
 	default:
 		return fmt.Sprintf("unknown job type %q", j.Type), nil
 	}

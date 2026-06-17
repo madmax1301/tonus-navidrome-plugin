@@ -458,3 +458,46 @@ func (c *Client) MixDiscovery(req MixDiscoveryRequest) (*MixDiscoveryResponse, e
 	}
 	return out, nil
 }
+
+// ---- LB Weekly Discovery -------------------------------------------------
+
+// LbWeeklyExistingTrack mirrors the entries in LbWeeklyDiscoveryResponse.Existing[].
+// SubsonicID is server-side-resolved so the build phase (runReconcile) doesn't
+// need an additional search3 call. Fields match the backend's existing[] items 1:1.
+type LbWeeklyExistingTrack struct {
+	SubsonicID string `json:"subsonic_id"`
+	Artist     string `json:"artist"`
+	Title      string `json:"title"`
+}
+
+// LbWeeklyDiscoveryRequest mirrors backend `PluginLbWeeklyDiscoveryRequest`.
+type LbWeeklyDiscoveryRequest struct {
+	NavidromeUser    string `json:"navidrome_user"`
+	ListenBrainzUser string `json:"listenbrainz_user"`
+	SourcePatch      string `json:"source_patch"`
+	Occurrence       int    `json:"occurrence"`
+	PlaylistName     string `json:"playlist_name"`
+}
+
+// LbWeeklyDiscoveryResponse is what /api/plugin/lbweekly/discovery returns:
+// the in-library "existing" tracks (synchronous), plus a flag that any
+// background processing has started.
+type LbWeeklyDiscoveryResponse struct {
+	Started  bool                    `json:"started"`
+	Existing []LbWeeklyExistingTrack `json:"existing"`
+}
+
+// LbWeeklyDiscovery fires the backend's POST /api/plugin/lbweekly/discovery.
+// Returns existing in-library tracks synchronously; backend may start background
+// tasks for missing tracks.
+func (c *Client) LbWeeklyDiscovery(req LbWeeklyDiscoveryRequest) (*LbWeeklyDiscoveryResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal lbweekly-discovery: %w", err)
+	}
+	out := &LbWeeklyDiscoveryResponse{}
+	if err := c.request("POST", "/api/plugin/lbweekly/discovery", body, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}

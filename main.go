@@ -75,6 +75,7 @@ type userMapping struct {
 	ListenBrainzUsername string      `json:"listenbrainz_username"`
 	PlaylistName         string      `json:"playlist_name"`
 	Mixes                []mixConfig `json:"mixes,omitempty"`
+	LbWeeklyMirror       bool        `json:"lb_weekly_mirror"`
 }
 
 func getInt(key string, fallback int) int {
