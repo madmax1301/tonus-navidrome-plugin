@@ -3,8 +3,8 @@
   "$id": "navidrome://plugins/manifest/tonus-sync",
   "name": "tonus-sync",
   "author": "madmax1301",
-  "version": "0.4.0",
-  "description": "Triggers tonus (FastAPI backend) on a schedule for automatic discovery + download per Navidrome user. Each configured user gets a default Discovery playlist (LB top-artists → Deezer artist-radio) plus optional Genre Mixes — weekly Spotify-style playlists per genre with configurable Wed/Fri discovery+build cycle. Genre Mixes use a fixed playlist (replace pattern) so users can copy favorites into their own playlists.",
+  "version": "0.5.0",
+  "description": "Triggers tonus (FastAPI backend) on a schedule for automatic sync per Navidrome user. Each configured user gets LB Weekly Mirror (four 'Created For You' ListenBrainz playlists kept in sync) plus optional Genre Mixes — weekly Spotify-style playlists per genre with configurable Wed/Fri discovery+build cycle. Genre Mixes use a fixed playlist (replace pattern) so users can copy favorites into their own playlists.",
   "website": "https://github.com/madmax1301/tonus-navidrome-plugin",
   "permissions": {
     "http": {
@@ -12,17 +12,17 @@
       "requiredHosts": ["*"]
     },
     "scheduler": {
-      "reason": "Registers a recurring cron job per discovery type — the global default-discovery (daily 07:00) plus one discovery+build pair per configured Genre Mix (Wed 02:00 / Fri 06:00 by default)."
+      "reason": "Registers a recurring cron job per discovery type — the global LB-Weekly-Mirror sync (daily 07:00) plus one discovery+build pair per configured Genre Mix (Wed 02:00 / Fri 06:00 by default)."
     },
     "kvstore": {
       "reason": "Persists last-run status (timestamps, counts, last error) per Navidrome user.",
       "maxSize": "1MB"
     },
     "subsonicapi": {
-      "reason": "Creates and updates per-user Discovery playlists in Navidrome on behalf of each configured user."
+      "reason": "Creates and updates per-user LB Weekly Mirror playlists and Genre Mix playlists in Navidrome on behalf of each configured user."
     },
     "users": {
-      "reason": "Discovery + playlist creation runs in the context of each selected Navidrome user."
+      "reason": "LB Weekly Mirror + playlist creation runs in the context of each selected Navidrome user."
     },
     "taskqueue": {
       "reason": "One async task per Navidrome user runs the trigger + reconcile pipeline outside the cron callback timeout.",
@@ -50,34 +50,10 @@
           "description": "When to run the sync for all configured users. Default: '0 7 * * *' (daily at 07:00). Use crontab.guru to test custom values.",
           "default": "0 7 * * *"
         },
-        "top_artists": {
-          "type": "integer",
-          "title": "Top N Artists (global)",
-          "description": "How many top-played LB artists to sample for discovery. Applies to every configured user.",
-          "minimum": 1,
-          "maximum": 50,
-          "default": 10
-        },
-        "tracks_per_artist": {
-          "type": "integer",
-          "title": "Tracks per Artist (global)",
-          "description": "Discovery depth per artist (Deezer artist-radio). Applies to every configured user.",
-          "minimum": 1,
-          "maximum": 20,
-          "default": 5
-        },
-        "max_queue_per_run": {
-          "type": "integer",
-          "title": "Max Queue per Run (global, per user)",
-          "description": "Hard cap on how many tracks can be queued per user per cron run.",
-          "minimum": 1,
-          "maximum": 500,
-          "default": 30
-        },
         "users": {
           "type": "array",
           "title": "User Mappings",
-          "description": "Each entry maps a Navidrome user to a ListenBrainz account and the name of their Discovery playlist. Use the + button to add additional users. The Discovery playlist is created and owned by the Navidrome user.",
+          "description": "Each entry maps a Navidrome user to a ListenBrainz account. Use the + button to add additional users.",
           "minItems": 1,
           "items": {
             "type": "object",
@@ -91,13 +67,13 @@
               "listenbrainz_username": {
                 "type": "string",
                 "title": "ListenBrainz Username",
-                "description": "Public LB user whose top-artists drive discovery for this Navidrome user."
+                "description": "Public LB user whose 'Created For You' playlists are mirrored for this Navidrome user."
               },
-              "playlist_name": {
-                "type": "string",
-                "title": "Playlist Name Template",
-                "description": "Subsonic playlist name. Placeholder {date} → YYYY-MM-DD, {user} → Navidrome username. Default: 'Discovery {date}'.",
-                "default": "Discovery {date}"
+              "lb_weekly_mirror": {
+                "type": "boolean",
+                "title": "LB Weekly Mirror",
+                "description": "Spiegelt die vier ListenBrainz 'Created For You'-Playlists (Weekly/Last Week's Exploration + Jams) als Navidrome-Playlists dieses Users und hält sie aktuell.",
+                "default": true
               },
               "mixes": {
                 "type": "array",
@@ -230,17 +206,9 @@
         },
         {
           "type": "Group",
-          "label": "Schedule + Global Discovery Tuning",
+          "label": "Schedule",
           "elements": [
-            { "type": "Control", "scope": "#/properties/cron_expression" },
-            {
-              "type": "HorizontalLayout",
-              "elements": [
-                { "type": "Control", "scope": "#/properties/top_artists" },
-                { "type": "Control", "scope": "#/properties/tracks_per_artist" },
-                { "type": "Control", "scope": "#/properties/max_queue_per_run" }
-              ]
-            }
+            { "type": "Control", "scope": "#/properties/cron_expression" }
           ]
         },
         {
@@ -257,7 +225,7 @@
                   "elements": [
                     { "type": "Control", "scope": "#/properties/navidrome_username" },
                     { "type": "Control", "scope": "#/properties/listenbrainz_username" },
-                    { "type": "Control", "scope": "#/properties/playlist_name" },
+                    { "type": "Control", "scope": "#/properties/lb_weekly_mirror" },
                     {
                       "type": "Control",
                       "scope": "#/properties/mixes",
