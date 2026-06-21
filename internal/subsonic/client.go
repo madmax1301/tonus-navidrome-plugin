@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/host"
@@ -254,4 +255,77 @@ func (c *Client) AddTracksIdempotent(pl *PlaylistRef, songIDs []string) (int, er
 		pl.ExistingIDs[id] = struct{}{}
 	}
 	return len(toAdd), nil
+}
+
+// ReplaceTracks sets the playlist to exactly `songIDs`, in order — used by
+// the Genre-Mix build phase for the Spotify-style "weekly playlist rotates
+// content, ID stays stable" pattern. Implementation: one updatePlaylist call
+// with both songIndexToRemove (all current entries) and songIdToAdd (new
+// content) — Subsonic supports both query parameters in a single request.
+//
+// pl.ExistingIDs is updated to the new song-set on success.
+func (c *Client) ReplaceTracks(pl *PlaylistRef, songIDs []string) error {
+	if pl == nil || pl.ID == "" {
+		return fmt.Errorf("subsonic replaceTracks: nil playlist")
+	}
+
+	// Re-fetch the current ordered entries so we know how many indices to
+	// remove. The PlaylistRef.ExistingIDs is a set without ordering, but
+	// updatePlaylist needs explicit indices.
+	indices, err := c.playlistTrackIndices(pl.ID)
+	if err != nil {
+		return fmt.Errorf("subsonic replaceTracks: get indices: %w", err)
+	}
+
+	q := url.Values{}
+	q.Set("playlistId", pl.ID)
+	for _, idx := range indices {
+		q.Add("songIndexToRemove", strconv.Itoa(idx))
+	}
+	for _, id := range songIDs {
+		if id == "" {
+			continue
+		}
+		q.Add("songIdToAdd", id)
+	}
+	if _, err := c.call("updatePlaylist", q); err != nil {
+		return fmt.Errorf("subsonic replaceTracks: %w", err)
+	}
+
+	// Replace the in-memory set so subsequent calls in the same task have
+	// accurate state.
+	pl.ExistingIDs = make(map[string]struct{}, len(songIDs))
+	for _, id := range songIDs {
+		if id != "" {
+			pl.ExistingIDs[id] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// playlistTrackIndices returns 0-based indices of all current tracks in the
+// playlist. Used by ReplaceTracks to know how many songIndexToRemove entries
+// to send.
+func (c *Client) playlistTrackIndices(playlistID string) ([]int, error) {
+	q := url.Values{}
+	q.Set("id", playlistID)
+	body, err := c.call("getPlaylist", q)
+	if err != nil {
+		return nil, err
+	}
+	var pl struct {
+		Playlist struct {
+			Entry []struct {
+				ID string `json:"id"`
+			} `json:"entry"`
+		} `json:"playlist"`
+	}
+	if err := json.Unmarshal(body, &pl); err != nil {
+		return nil, fmt.Errorf("subsonic getPlaylist (indices): parse: %w", err)
+	}
+	indices := make([]int, len(pl.Playlist.Entry))
+	for i := range pl.Playlist.Entry {
+		indices[i] = i
+	}
+	return indices, nil
 }

@@ -1,25 +1,25 @@
-// tonus-navidrome-plugin: Navidrome plugin that triggers the tonus
-// FastAPI backend for per-user discovery + automated playlist creation.
+// tonus-navidrome-plugin: Navidrome plugin that mirrors ListenBrainz Weekly
+// playlists and builds genre-mix playlists for Navidrome users.
 //
 // Architecture:
-//   1. OnInit registers the cron and creates the TaskQueue. No work yet.
+//   1. OnInit registers the global cron ("tonus-sync") and per-(user,mix)
+//      crons, and creates the TaskQueue. No work yet.
 //   2. OnCallback (every cron tick) reads the config (tonus URL/token,
-//      schedule, global discovery tuning, the user-mapping array) and enqueues
-//      one trigger-sync task + one reconcile task per configured user. Returns
-//      in <1s — well below the plugin-callback timeout.
-//   3. OnTaskExecute runs each task asynchronously. trigger-sync hits
-//      /api/plugin/sync. reconcile pulls /api/plugin/finished-tracks and
-//      pushes the matched Subsonic IDs into the user-owned playlist via
-//      host.SubsonicAPICall (which authenticates as that user automatically
-//      thanks to the `users` permission).
+//      schedule, user-mapping array) and enqueues jobs. For the global cron
+//      it enqueues one (Discovery + Reconcile) pair per LB-Weekly slot per
+//      user with LbWeeklyMirror==true. Returns in <1s — well below the
+//      plugin-callback timeout.
+//   3. OnTaskExecute runs each task asynchronously. LbWeeklyDiscovery hits
+//      /api/plugin/lbweekly/discovery. Reconcile pulls
+//      /api/plugin/finished-tracks and pushes the matched Subsonic IDs into
+//      the user-owned playlist via host.SubsonicAPICall (which authenticates
+//      as that user automatically thanks to the `users` permission).
 package main
 
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/host"
 	"github.com/navidrome/navidrome/plugins/pdk/go/lifecycle"
@@ -30,39 +30,47 @@ import (
 	"tonus-navidrome-plugin/internal/tasks"
 )
 
-// scheduleName is the cron-job key used both at registration and inside
-// OnCallback to dispatch.
+// scheduleName is the cron-job key for the global default-discovery cron.
+// Mix-cron keys follow the pattern "mix-discovery/<user>/<mix>" and
+// "mix-build/<user>/<mix>" — see scheduleKeyFor / parseMixScheduleKey below.
 const scheduleName = "tonus-sync"
+
+// Mix-cron key prefixes — used both at registration in OnInit and parsing in OnCallback.
+const (
+	mixDiscoveryKeyPrefix = "mix-discovery/"
+	mixBuildKeyPrefix     = "mix-build/"
+)
 
 // Defaults mirror the JSON-Schema defaults; used when a key is set-but-empty.
 const (
-	defaultCron            = "0 7 * * *"
-	defaultTopArtists      = 10
-	defaultTracksPerArtist = 5
-	defaultMaxQueuePerRun  = 30
-	defaultPlaylistTpl     = "Discovery {date}"
+	defaultCron             = "0 7 * * *"
+	defaultMixDiscoveryCron = "0 2 * * 3"
+	defaultMixBuildCron     = "0 6 * * 5"
+	defaultMixCount         = 25
+	defaultMixDiscoveryRatio = 0.4
+	defaultMixPlaylistTpl   = "{name}"
 )
 
 type plugin struct{}
 
+// mixConfig mirrors one entry of the `users[].mixes[]` array in the manifest.
+type mixConfig struct {
+	Name             string  `json:"name"`
+	Genre            string  `json:"genre"`
+	DiscoveryCron    string  `json:"discovery_cron"`
+	BuildCron        string  `json:"build_cron"`
+	Count            int     `json:"count"`
+	DiscoveryRatio   float64 `json:"discovery_ratio"`
+	PlaylistTemplate string  `json:"playlist_template"`
+}
+
 // userMapping mirrors the `users` array in the manifest config. Read out of
 // pdk.GetConfig("users") which returns a JSON-string of this array.
 type userMapping struct {
-	NavidromeUsername    string `json:"navidrome_username"`
-	ListenBrainzUsername string `json:"listenbrainz_username"`
-	PlaylistName         string `json:"playlist_name"`
-}
-
-func getInt(key string, fallback int) int {
-	raw, ok := pdk.GetConfig(key)
-	if !ok || raw == "" {
-		return fallback
-	}
-	v, err := strconv.Atoi(raw)
-	if err != nil || v <= 0 {
-		return fallback
-	}
-	return v
+	NavidromeUsername    string      `json:"navidrome_username"`
+	ListenBrainzUsername string      `json:"listenbrainz_username"`
+	Mixes                []mixConfig `json:"mixes,omitempty"`
+	LbWeeklyMirror       bool        `json:"lb_weekly_mirror"`
 }
 
 func loadUsers() ([]userMapping, error) {
@@ -78,19 +86,6 @@ func loadUsers() ([]userMapping, error) {
 		return nil, fmt.Errorf("`users` array is empty")
 	}
 	return out, nil
-}
-
-// substituteTemplate replaces {date} → YYYY-MM-DD and {user} → navidromeUser.
-// Done at enqueue-time (in OnCallback) so each task carries the resolved name
-// — keeps the Reconcile-Task deterministic across multiple run-attempts.
-func substituteTemplate(tpl, navidromeUser string) string {
-	if tpl == "" {
-		return ""
-	}
-	out := tpl
-	out = strings.ReplaceAll(out, "{date}", time.Now().Format("2006-01-02"))
-	out = strings.ReplaceAll(out, "{user}", navidromeUser)
-	return out
 }
 
 // OnInit registers the cron and creates the task queue. We don't validate
@@ -128,18 +123,111 @@ func (p *plugin) OnInit() error {
 		"tonus-sync initialized: url=%s, cron=%q, queue=%s",
 		tonusURL, cronExpr, tasks.QueueName,
 	))
+
+	// Mix-Crons: pro (User × Mix × Phase) ein eigener Cron-Schedule mit
+	// pfadartigem Key. OnCallback parst den Key zurück + dispatcht den
+	// passenden Job-Type (mix-discovery oder mix-build).
+	users, err := loadUsers()
+	if err != nil {
+		// Initial users may be empty if the user hasn't configured anything yet —
+		// not fatal at OnInit time. Mix-Crons get registered on next plugin
+		// reload after the user adds Mixes.
+		pdk.Log(pdk.LogInfo, "no users configured yet — Mix crons will be registered on next reload")
+		return nil
+	}
+	mixCount := 0
+	for _, u := range users {
+		if u.NavidromeUsername == "" {
+			continue
+		}
+		for _, m := range u.Mixes {
+			if m.Name == "" || m.Genre == "" {
+				continue
+			}
+			discCron := m.DiscoveryCron
+			if discCron == "" {
+				discCron = defaultMixDiscoveryCron
+			}
+			buildCron := m.BuildCron
+			if buildCron == "" {
+				buildCron = defaultMixBuildCron
+			}
+			discKey := mixDiscoveryKeyPrefix + u.NavidromeUsername + "/" + m.Name
+			buildKey := mixBuildKeyPrefix + u.NavidromeUsername + "/" + m.Name
+			if _, err := host.SchedulerScheduleRecurring(discCron, discKey, discKey); err != nil {
+				pdk.Log(pdk.LogError, fmt.Sprintf("schedule %q (%s): %s", discKey, discCron, err.Error()))
+				continue
+			}
+			if _, err := host.SchedulerScheduleRecurring(buildCron, buildKey, buildKey); err != nil {
+				pdk.Log(pdk.LogError, fmt.Sprintf("schedule %q (%s): %s", buildKey, buildCron, err.Error()))
+				continue
+			}
+			mixCount++
+			pdk.Log(pdk.LogInfo, fmt.Sprintf(
+				"mix scheduled: user=%q name=%q genre=%q discovery=%q build=%q",
+				u.NavidromeUsername, m.Name, m.Genre, discCron, buildCron,
+			))
+		}
+	}
+	if mixCount > 0 {
+		pdk.Log(pdk.LogInfo, fmt.Sprintf("registered %d genre-mix cron pairs", mixCount))
+	}
 	return nil
 }
 
-// OnCallback (cron tick): enqueue trigger + reconcile per user, return fast.
+// parseMixScheduleKey splits a mix-cron key like
+// "mix-discovery/<user>/<mix>" or "mix-build/<user>/<mix>" into its parts.
+// Returns (jobType, navidromeUser, mixName, ok). ok=false if the key
+// doesn't match any mix-cron pattern.
+//
+// User and mix names may contain slashes — they get re-joined from the
+// remaining parts. In practice users won't put slashes there, but it's
+// safer than splitting on N=3.
+func parseMixScheduleKey(key string) (jobType, user, mix string, ok bool) {
+	for _, prefix := range []string{mixDiscoveryKeyPrefix, mixBuildKeyPrefix} {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(key, prefix)
+		// rest = "<user>/<mix>" — split on first "/" only
+		idx := strings.Index(rest, "/")
+		if idx <= 0 || idx >= len(rest)-1 {
+			return "", "", "", false
+		}
+		user = rest[:idx]
+		mix = rest[idx+1:]
+		jobType = strings.TrimSuffix(prefix, "/")
+		return jobType, user, mix, true
+	}
+	return "", "", "", false
+}
+
+// OnCallback (cron tick): dispatches based on schedule key.
+//   - "tonus-sync"            → classic per-user discovery (trigger+reconcile)
+//   - "mix-discovery/u/m"     → mix-discovery task for that user×mix
+//   - "mix-build/u/m"         → mix-build task for that user×mix
+//
+// All paths return fast (<1 s) — actual work happens in TaskQueue handlers
+// outside the 30-s plugin-callback timeout.
 func (p *plugin) OnCallback(req scheduler.SchedulerCallbackRequest) error {
-	if req.ScheduleID != scheduleName && req.Payload != scheduleName {
-		pdk.Log(pdk.LogWarn, "OnCallback got unexpected schedule: id="+req.ScheduleID+" payload="+req.Payload)
-		return nil
+	key := req.ScheduleID
+	if key == "" {
+		key = req.Payload
 	}
 
 	tonusURL, _ := pdk.GetConfig("tonus_url")
 	tonusToken, _ := pdk.GetConfig("tonus_token")
+
+	// Mix-cron path?
+	if jobType, user, mix, ok := parseMixScheduleKey(key); ok {
+		return p.dispatchMixCallback(jobType, user, mix, tonusURL, tonusToken)
+	}
+
+	// Classic discovery path
+	if key != scheduleName {
+		pdk.Log(pdk.LogWarn, "OnCallback got unexpected schedule: id="+req.ScheduleID+" payload="+req.Payload)
+		return nil
+	}
 
 	users, err := loadUsers()
 	if err != nil {
@@ -147,69 +235,145 @@ func (p *plugin) OnCallback(req scheduler.SchedulerCallbackRequest) error {
 		return nil
 	}
 
-	topArtists := getInt("top_artists", defaultTopArtists)
-	tracksPerArtist := getInt("tracks_per_artist", defaultTracksPerArtist)
-	maxQueue := getInt("max_queue_per_run", defaultMaxQueuePerRun)
-
-	enqueuedTrigger := 0
+	enqueuedDiscovery := 0
 	enqueuedReconcile := 0
 
 	for _, u := range users {
-		if u.NavidromeUsername == "" || u.ListenBrainzUsername == "" {
-			pdk.Log(pdk.LogWarn, fmt.Sprintf(
-				"tonus-sync: skipping user mapping with missing fields (nd=%q, lb=%q)",
-				u.NavidromeUsername, u.ListenBrainzUsername,
-			))
+		if u.NavidromeUsername == "" || !u.LbWeeklyMirror {
 			continue
 		}
-		playlistTpl := u.PlaylistName
-		if playlistTpl == "" {
-			playlistTpl = defaultPlaylistTpl
-		}
-		resolvedPlaylist := substituteTemplate(playlistTpl, u.NavidromeUsername)
-
-		base := tasks.Job{
-			NavidromeUser:    u.NavidromeUsername,
-			ListenBrainzUser: u.ListenBrainzUsername,
-			PlaylistName:     resolvedPlaylist,
-			TonusURL:       tonusURL,
-			TonusToken:     tonusToken,
-			TopArtists:       topArtists,
-			TracksPerArtist:  tracksPerArtist,
-			MaxQueuePerRun:   maxQueue,
-		}
-
-		// 1) Trigger-task → backend kicks off discovery + download for this user.
-		trigger := base
-		trigger.Type = tasks.JobTriggerSync
-		if payload, err := trigger.Marshal(); err == nil {
-			if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
-				pdk.Log(pdk.LogError, fmt.Sprintf(
-					"enqueue trigger %q: %s", u.NavidromeUsername, err.Error(),
-				))
-			} else {
-				enqueuedTrigger++
+		for _, slot := range tasks.LbWeeklySlots {
+			base := tasks.Job{
+				NavidromeUser:    u.NavidromeUsername,
+				ListenBrainzUser: u.ListenBrainzUsername,
+				PlaylistName:     slot.PlaylistName,
+				LbSourcePatch:    slot.SourcePatch,
+				LbOccurrence:     slot.Occurrence,
+				TonusURL:         tonusURL,
+				TonusToken:       tonusToken,
 			}
-		}
 
-		// 2) Reconcile-task → pull finished tracks + push to user playlist.
-		// Catches tracks from earlier runs that finished in the meantime.
-		reconcile := base
-		reconcile.Type = tasks.JobReconcile
-		if payload, err := reconcile.Marshal(); err == nil {
-			if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
-				pdk.Log(pdk.LogError, fmt.Sprintf(
-					"enqueue reconcile %q: %s", u.NavidromeUsername, err.Error(),
-				))
-			} else {
-				enqueuedReconcile++
+			// 1) Discovery → backend queues missing LB-Weekly tracks for download.
+			disc := base
+			disc.Type = tasks.JobLbWeeklyDiscovery
+			if payload, err := disc.Marshal(); err == nil {
+				if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
+					pdk.Log(pdk.LogError, fmt.Sprintf(
+						"enqueue lbweekly-discovery %q/%q: %s",
+						u.NavidromeUsername, slot.PlaylistName, err.Error(),
+					))
+				} else {
+					enqueuedDiscovery++
+				}
+			}
+
+			// 2) Reconcile → pull finished tracks + push to user playlist.
+			// Catches tracks from earlier runs that finished in the meantime.
+			rec := base
+			rec.Type = tasks.JobReconcile
+			if payload, err := rec.Marshal(); err == nil {
+				if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
+					pdk.Log(pdk.LogError, fmt.Sprintf(
+						"enqueue reconcile %q/%q: %s",
+						u.NavidromeUsername, slot.PlaylistName, err.Error(),
+					))
+				} else {
+					enqueuedReconcile++
+				}
 			}
 		}
 	}
 
 	pdk.Log(pdk.LogInfo, fmt.Sprintf(
-		"tonus-sync: enqueued %d trigger + %d reconcile tasks (users=%d)",
-		enqueuedTrigger, enqueuedReconcile, len(users),
+		"tonus-sync: enqueued %d lbweekly-discovery + %d reconcile tasks (users=%d)",
+		enqueuedDiscovery, enqueuedReconcile, len(users),
+	))
+	return nil
+}
+
+// dispatchMixCallback handles a mix-discovery or mix-build cron tick. Finds
+// the user/mix in the current config, builds the corresponding Job, and
+// enqueues it. Returns fast — actual work runs in the TaskQueue handlers.
+func (p *plugin) dispatchMixCallback(jobType, navidromeUser, mixName, tonusURL, tonusToken string) error {
+	users, err := loadUsers()
+	if err != nil {
+		pdk.Log(pdk.LogError, "mix-callback: "+err.Error())
+		return nil
+	}
+
+	// Find matching (user, mix) pair from the current config.
+	var found *mixConfig
+	for _, u := range users {
+		if u.NavidromeUsername != navidromeUser {
+			continue
+		}
+		for i := range u.Mixes {
+			if u.Mixes[i].Name == mixName {
+				found = &u.Mixes[i]
+				break
+			}
+		}
+		break
+	}
+	if found == nil {
+		pdk.Log(pdk.LogWarn, fmt.Sprintf(
+			"mix-callback: no matching mix for user=%q name=%q (config changed since cron registered?)",
+			navidromeUser, mixName,
+		))
+		return nil
+	}
+
+	// Defaults applied here, mirroring the JSON-Schema defaults — keeps the
+	// task payload self-contained even if the config is sparse.
+	count := found.Count
+	if count <= 0 {
+		count = defaultMixCount
+	}
+	ratio := found.DiscoveryRatio
+	if ratio <= 0 {
+		ratio = defaultMixDiscoveryRatio
+	}
+	tpl := found.PlaylistTemplate
+	if tpl == "" {
+		tpl = defaultMixPlaylistTpl
+	}
+
+	job := tasks.Job{
+		NavidromeUser:       navidromeUser,
+		TonusURL:            tonusURL,
+		TonusToken:          tonusToken,
+		MixName:             found.Name,
+		MixGenre:            found.Genre,
+		MixCount:            count,
+		MixDiscoveryRatio:   ratio,
+		MixPlaylistTemplate: tpl,
+	}
+
+	switch jobType {
+	case strings.TrimSuffix(mixDiscoveryKeyPrefix, "/"):
+		job.Type = tasks.JobMixDiscovery
+	case strings.TrimSuffix(mixBuildKeyPrefix, "/"):
+		job.Type = tasks.JobMixBuild
+	default:
+		pdk.Log(pdk.LogError, "mix-callback: unknown jobType="+jobType)
+		return nil
+	}
+
+	payload, err := job.Marshal()
+	if err != nil {
+		pdk.Log(pdk.LogError, "mix-callback: marshal: "+err.Error())
+		return nil
+	}
+	if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
+		pdk.Log(pdk.LogError, fmt.Sprintf(
+			"mix-callback: enqueue %s for %q/%q: %s", jobType, navidromeUser, mixName, err.Error(),
+		))
+		return nil
+	}
+
+	pdk.Log(pdk.LogInfo, fmt.Sprintf(
+		"mix-callback: enqueued %s for user=%q mix=%q (genre=%s)",
+		jobType, navidromeUser, mixName, found.Genre,
 	))
 	return nil
 }

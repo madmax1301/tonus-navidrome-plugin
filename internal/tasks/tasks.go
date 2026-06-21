@@ -1,13 +1,23 @@
 // Package tasks defines the asynchronous job format for the plugin's
-// TaskQueue. The cron-callback enqueues one job per Navidrome user per
-// run; the OnTaskExecute hook deserializes and dispatches them.
+// TaskQueue. The cron-callback enqueues jobs per Navidrome user per run;
+// the OnTaskExecute hook deserializes and dispatches them.
 //
-// Two job types:
-//   - JobTriggerSync   → POST /api/plugin/sync for one user (fire-and-forget)
-//   - JobReconcile     → query /api/plugin/finished-tracks + push to Subsonic
+// Job types:
+//   - JobReconcile         → query /api/plugin/finished-tracks + push to Subsonic
+//   - JobMixDiscovery      → POST /api/plugin/mix/discovery for one (user, mix) —
+//                            gets the in-library "existing" list back, persists it
+//                            in KVStore for the build phase, queues missing tracks
+//                            for download in the background
+//   - JobMixBuild          → reads KVStore "existing" + queries finished-tracks for
+//                            the same (user, mix), then replaces the user's Subsonic
+//                            playlist content with the merged result (Spotify-style
+//                            weekly mix with stable playlist ID)
+//   - JobLbWeeklyDiscovery → POST /api/plugin/lbweekly/discovery for one (user,
+//                            slot) — gets the in-library "existing" list back,
+//                            persists it in KVStore; build phase reuses runReconcile
 //
-// They run in the same TaskQueue (concurrency 1) so per-user runs never
-// overlap and the playlist-update is idempotent regardless of order.
+// All jobs run in the same TaskQueue (concurrency 1) so per-user runs never
+// overlap and Subsonic playlist updates are well-ordered.
 package tasks
 
 import (
@@ -30,9 +40,26 @@ const QueueName = "tonus-sync"
 type JobType string
 
 const (
-	JobTriggerSync JobType = "trigger-sync"
-	JobReconcile   JobType = "reconcile"
+	JobReconcile         JobType = "reconcile"
+	JobMixDiscovery      JobType = "mix-discovery"
+	JobMixBuild          JobType = "mix-build"
+	JobLbWeeklyDiscovery JobType = "lbweekly-discovery"
 )
+
+// LbWeeklySlot describes one of the four mirrored LB playlists.
+type LbWeeklySlot struct {
+	PlaylistName string // Navidrome-side name
+	SourcePatch  string // LB source_patch parameter
+	Occurrence   int    // 0 = current week, 1 = previous week
+}
+
+// LbWeeklySlots — fixed order, mirrored per user.
+var LbWeeklySlots = []LbWeeklySlot{
+	{"Weekly Exploration", "weekly-exploration", 0},
+	{"Weekly Jams", "weekly-jams", 0},
+	{"Last Week's Exploration", "weekly-exploration", 1},
+	{"Last Week's Jams", "weekly-jams", 1},
+}
 
 // Job is the canonical payload format. Marshal → bytes → host.TaskEnqueue
 // in main.go; OnTaskExecute does Unmarshal → Dispatch.
@@ -46,10 +73,18 @@ type Job struct {
 	TonusURL   string `json:"tonus_url"`
 	TonusToken string `json:"tonus_token"`
 
-	// Discovery tuning.
-	TopArtists      int `json:"top_artists"`
-	TracksPerArtist int `json:"tracks_per_artist"`
-	MaxQueuePerRun  int `json:"max_queue_per_run"`
+	// Mix-specific (used by JobMixDiscovery + JobMixBuild). Empty for
+	// reconcile/lbweekly jobs. Set in OnCallback when the schedule key
+	// belongs to a per-(user, mix) cron.
+	MixName             string  `json:"mix_name,omitempty"`
+	MixGenre            string  `json:"mix_genre,omitempty"`
+	MixCount            int     `json:"mix_count,omitempty"`
+	MixDiscoveryRatio   float64 `json:"mix_discovery_ratio,omitempty"`
+	MixPlaylistTemplate string  `json:"mix_playlist_template,omitempty"`
+
+	// LB-Weekly-specific (used by JobLbWeeklyDiscovery).
+	LbSourcePatch string `json:"lb_source_patch,omitempty"`
+	LbOccurrence  int    `json:"lb_occurrence,omitempty"`
 }
 
 // Marshal returns the task payload bytes for host.TaskEnqueue.
@@ -64,54 +99,26 @@ func (j *Job) Marshal() ([]byte, error) {
 //   - both empty       → success
 func (j *Job) Dispatch() (string, error) {
 	switch j.Type {
-	case JobTriggerSync:
-		return runTriggerSync(j)
 	case JobReconcile:
 		return runReconcile(j)
+	case JobMixDiscovery:
+		return runMixDiscovery(j)
+	case JobMixBuild:
+		return runMixBuild(j)
+	case JobLbWeeklyDiscovery:
+		return runLbWeeklyDiscovery(j)
 	default:
 		return fmt.Sprintf("unknown job type %q", j.Type), nil
 	}
 }
 
-// ---- TriggerSync ---------------------------------------------------------
-
-func runTriggerSync(j *Job) (string, error) {
-	cl := client.New(j.TonusURL, j.TonusToken)
-
-	// Health-Check first so config errors surface immediately, not 24h later.
-	h, err := cl.Health()
-	if err != nil {
-		return "", fmt.Errorf("trigger-sync %q: health: %w", j.NavidromeUser, err)
-	}
-	if h.AuthRequired && j.TonusToken == "" {
-		return fmt.Sprintf("trigger-sync %q: backend requires token but none configured", j.NavidromeUser), nil
-	}
-
-	resp, err := cl.TriggerSync(client.TriggerSyncRequest{
-		ListenBrainzUser: j.ListenBrainzUser,
-		TopArtists:       j.TopArtists,
-		TracksPerArtist:  j.TracksPerArtist,
-		MaxTotal:         j.MaxQueuePerRun,
-		Location:         "navidrome",
-		PlaylistName:     j.PlaylistName,
-		NavidromeUser:    j.NavidromeUser,
-	})
-	if err != nil {
-		return "", fmt.Errorf("trigger-sync %q: %w", j.NavidromeUser, err)
-	}
-
-	pdk.Log(pdk.LogInfo, fmt.Sprintf(
-		"trigger-sync %q (lb=%s) accepted: started=%v %s",
-		j.NavidromeUser, j.ListenBrainzUser, resp.Started, resp.Message,
-	))
-	writeUserStatus(j.NavidromeUser, userStatus{
-		LastTriggerMs:    time.Now().UnixMilli(),
-		LastTriggerOK:    true,
-		LastTriggerInfo:  fmt.Sprintf("backend ack: %s", resp.Message),
-		ListenBrainzUser: j.ListenBrainzUser,
-		PlaylistName:     j.PlaylistName,
-	})
-	return "", nil
+// lbWeeklyExistingTrack is a local mirror of client.LbWeeklyExistingTrack used
+// to unmarshal the KVStore-persisted existing-list without a circular import.
+// Must stay in sync with client.LbWeeklyExistingTrack (json tags are canonical).
+type lbWeeklyExistingTrack struct {
+	SubsonicID string `json:"subsonic_id"`
+	Artist     string `json:"artist"`
+	Title      string `json:"title"`
 }
 
 // ---- Reconcile -----------------------------------------------------------
@@ -123,6 +130,26 @@ func runReconcile(j *Job) (string, error) {
 	}
 	cl := client.New(j.TonusURL, j.TonusToken)
 
+	// 0. Read the LB-Weekly existing-list from KVStore (persisted by
+	// runLbWeeklyDiscovery). Must happen BEFORE the finished.Count==0 check
+	// so that a playlist consisting entirely of in-library tracks still gets
+	// built even when no downloads finished yet.
+	var existingTracks []lbWeeklyExistingTrack
+	kvKey := fmt.Sprintf("lbweekly:%s:%s", j.NavidromeUser, j.PlaylistName)
+	if kvBytes, ok, kvErr := host.KVStoreGet(kvKey); kvErr != nil {
+		pdk.Log(pdk.LogWarn, fmt.Sprintf(
+			"reconcile %q/%q: KVStoreGet %s failed (continuing without existing): %s",
+			j.NavidromeUser, j.PlaylistName, kvKey, kvErr.Error(),
+		))
+	} else if ok && len(kvBytes) > 0 {
+		if err := json.Unmarshal(kvBytes, &existingTracks); err != nil {
+			pdk.Log(pdk.LogWarn, fmt.Sprintf(
+				"reconcile %q/%q: parse KV %s: %s",
+				j.NavidromeUser, j.PlaylistName, kvKey, err.Error(),
+			))
+		}
+	}
+
 	// 1. Pull a small batch of finished tracks (limit=25 keeps backend
 	// search3-resolution + plugin Subsonic-write under the 30s task timeout).
 	// Remaining tracks come along on subsequent cron triggers.
@@ -130,8 +157,8 @@ func runReconcile(j *Job) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("reconcile %q: finished-tracks: %w", j.NavidromeUser, err)
 	}
-	if finished.Count == 0 {
-		pdk.Log(pdk.LogDebug, fmt.Sprintf("reconcile %q: no finished tracks yet", j.NavidromeUser))
+	if finished.Count == 0 && len(existingTracks) == 0 {
+		pdk.Log(pdk.LogDebug, fmt.Sprintf("reconcile %q: no finished tracks and no existing tracks yet", j.NavidromeUser))
 		return "", nil
 	}
 
@@ -153,11 +180,26 @@ func runReconcile(j *Job) (string, error) {
 		))
 	}
 
-	// 4. Backend already resolved Subsonic-IDs serverside (admin-auth search3,
+	// 4. Build the deduplicated song-ID list: existing in-library tracks first,
+	// then finished (downloaded) tracks. Existing IDs are already resolved
+	// server-side; finished tracks fall back to a search3 call if needed.
+	seen := make(map[string]struct{}, len(existingTracks)+finished.Count)
+	songIDs := make([]string, 0, len(existingTracks)+finished.Count)
+	for _, e := range existingTracks {
+		if e.SubsonicID == "" {
+			continue
+		}
+		if _, dup := seen[e.SubsonicID]; dup {
+			continue
+		}
+		seen[e.SubsonicID] = struct{}{}
+		songIDs = append(songIDs, e.SubsonicID)
+	}
+
+	// 5. Backend already resolved Subsonic-IDs serverside (admin-auth search3,
 	// cached in payload). For the rare case where backend couldn't resolve
 	// (Subsonic indexer not yet caught up at queue-time) we fall back to a
 	// single search3 call here. Misses are retried on the next cron tick.
-	songIDs := make([]string, 0, finished.Count)
 	unresolved := 0
 	for _, ft := range finished.Items {
 		sid := ft.SubsonicTrackID
@@ -176,6 +218,10 @@ func runReconcile(j *Job) (string, error) {
 			unresolved++
 			continue
 		}
+		if _, dup := seen[sid]; dup {
+			continue
+		}
+		seen[sid] = struct{}{}
 		songIDs = append(songIDs, sid)
 	}
 
@@ -185,8 +231,8 @@ func runReconcile(j *Job) (string, error) {
 	}
 
 	pdk.Log(pdk.LogInfo, fmt.Sprintf(
-		"reconcile %q: playlist=%q +%d tracks (already in playlist: %d, unresolved: %d, total finished: %d)",
-		j.NavidromeUser, pl.Name, added, len(songIDs)-added, unresolved, finished.Count,
+		"reconcile %q: playlist=%q +%d tracks (already in playlist: %d, existing: %d, unresolved: %d, total finished: %d)",
+		j.NavidromeUser, pl.Name, added, len(songIDs)-added, len(existingTracks), unresolved, finished.Count,
 	))
 	writeUserStatus(j.NavidromeUser, userStatus{
 		LastReconcileMs:        time.Now().UnixMilli(),

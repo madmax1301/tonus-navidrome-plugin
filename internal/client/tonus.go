@@ -33,29 +33,14 @@ type HealthResponse struct {
 	NowMs        int64  `json:"now_ms"`
 }
 
-// TrackHint mirrors what the tonus backend includes per item in the
-// /api/plugin/library/missing response. We pass it back unchanged on the
-// /api/download POST so the queue UI can display cover art etc. immediately,
-// without waiting for the metadata fetch.
+// TrackHint is passed to /api/download so the queue UI can display cover art
+// etc. immediately, without waiting for the metadata fetch.
 type TrackHint struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Artist   string `json:"artist"`
 	Album    string `json:"album"`
 	AlbumArt string `json:"album_art,omitempty"`
-}
-
-type MissingItem struct {
-	Artist    string    `json:"artist"`
-	Title     string    `json:"title"`
-	TrackID   string    `json:"track_id"`
-	TrackHint TrackHint `json:"track_hint"`
-}
-
-type LibraryMissingResponse struct {
-	Items  []MissingItem `json:"items"`
-	Count  int           `json:"count"`
-	Source string        `json:"source"`
 }
 
 // DownloadResponse covers the success case of POST /api/download. The 409
@@ -169,19 +154,6 @@ func (c *Client) Health() (*HealthResponse, error) {
 	return out, nil
 }
 
-func (c *Client) LibraryMissing(lbUser string, topN, perArtist, maxTotal int) (*LibraryMissingResponse, error) {
-	q := url.Values{}
-	q.Set("listenbrainz_user", lbUser)
-	q.Set("top_artists", fmt.Sprintf("%d", topN))
-	q.Set("tracks_per_artist", fmt.Sprintf("%d", perArtist))
-	q.Set("max_total", fmt.Sprintf("%d", maxTotal))
-	out := &LibraryMissingResponse{}
-	if err := c.request("GET", "/api/plugin/library/missing?"+q.Encode(), nil, out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *Client) ImportCSV(csvText, provider string, limit int) (*CSVImportResponse, error) {
 	if provider == "" {
 		provider = "deezer"
@@ -238,21 +210,6 @@ func (c *Client) SyncStatus() (*SyncStatusResponse, error) {
 	return out, nil
 }
 
-// TriggerSyncRequest mirrors backend `PluginSyncRequest`. PlaylistName + NavidromeUser
-// are optional; if NavidromeUser is set, finished tracks become discoverable via
-// /api/plugin/finished-tracks for plugin-side per-user playlist creation.
-// PlaylistName supports the {date} placeholder — backend substitutes it before use.
-type TriggerSyncRequest struct {
-	ListenBrainzUser string `json:"listenbrainz_user"`
-	TopArtists       int    `json:"top_artists"`
-	TracksPerArtist  int    `json:"tracks_per_artist"`
-	HistoryDays      int    `json:"history_days,omitempty"`
-	MaxTotal         int    `json:"max_total"`
-	Location         string `json:"location,omitempty"`
-	PlaylistName     string `json:"playlist_name,omitempty"`
-	NavidromeUser    string `json:"navidrome_user,omitempty"`
-}
-
 // FinishedTrack mirrors backend `/api/plugin/finished-tracks` items. The
 // SubsonicTrackID is resolved server-side (admin-auth search3) and cached in
 // the job payload — when present, the plugin can skip its own search3 call.
@@ -270,26 +227,6 @@ type FinishedTracksResponse struct {
 	Count          int             `json:"count"`
 	NavidromeUser  string          `json:"navidrome_user"`
 	SinceDays      int             `json:"since_days"`
-}
-
-type TriggerSyncResponse struct {
-	Started bool   `json:"started"`
-	Message string `json:"message"`
-}
-
-// TriggerSync fires the backend's POST /api/plugin/sync. Backend runs the
-// discovery+queue pipeline asynchronously and returns 200 immediately —
-// keeping us inside Navidrome's plugin-callback timeout.
-func (c *Client) TriggerSync(req TriggerSyncRequest) (*TriggerSyncResponse, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal sync trigger: %w", err)
-	}
-	out := &TriggerSyncResponse{}
-	if err := c.request("POST", "/api/plugin/sync", body, out); err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 // DownloadOutcome describes the result of a single Download call. We don't
@@ -384,6 +321,119 @@ func (c *Client) FinishedTracks(navidromeUser string, sinceDays int, playlistNam
 	}
 	out := &FinishedTracksResponse{}
 	if err := c.request("GET", "/api/plugin/finished-tracks?"+q.Encode(), nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// FinishedTracksByMix queries the backend for tracks of a given (user, mix)
+// — i.e. only items that were queued by an earlier mix-discovery run with
+// the matching plugin_mix_name marker in their payload.
+//
+// Backend MAY not yet support the mix_name filter (Plugin-Side PR ahead of
+// Backend-Side PR 3.5). In that case the call still works but returns all
+// of the user's finished tracks; the caller should be tolerant of extra
+// items in the response.
+func (c *Client) FinishedTracksByMix(navidromeUser, mixName string, sinceDays int) (*FinishedTracksResponse, error) {
+	if sinceDays <= 0 {
+		sinceDays = 14
+	}
+	q := url.Values{}
+	q.Set("navidrome_user", navidromeUser)
+	q.Set("mix_name", mixName)
+	q.Set("since_days", fmt.Sprintf("%d", sinceDays))
+	out := &FinishedTracksResponse{}
+	if err := c.request("GET", "/api/plugin/finished-tracks?"+q.Encode(), nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ---- Mix Discovery -------------------------------------------------------
+
+// MixDiscoveryRequest mirrors backend `PluginMixDiscoveryRequest`. The mix
+// is identified by (NavidromeUser, MixName); Genre drives the LB/MB
+// tag-search; Count caps the final playlist size; DiscoveryRatio decides
+// the new-vs-familiar split (0.4 = 40% new / 60% familiar by default).
+type MixDiscoveryRequest struct {
+	NavidromeUser  string  `json:"navidrome_user"`
+	MixName        string  `json:"mix_name"`
+	Genre          string  `json:"genre"`
+	Count          int     `json:"count"`
+	DiscoveryRatio float64 `json:"discovery_ratio"`
+}
+
+// MixExisting mirrors the entries in MixDiscoveryResponse.Existing[].
+// SubsonicID is server-side-resolved so the build phase doesn't need
+// another search3 call to attach these to a playlist.
+type MixExisting struct {
+	SubsonicID string `json:"subsonic_id"`
+	Artist     string `json:"artist"`
+	Title      string `json:"title"`
+}
+
+// MixDiscoveryResponse is what /api/plugin/mix/discovery returns: the
+// in-library "existing" tracks (synchronous), plus a flag that the
+// background queueing of missing tracks has started.
+type MixDiscoveryResponse struct {
+	Started  bool          `json:"started"`
+	Message  string        `json:"message"`
+	Existing []MixExisting `json:"existing"`
+}
+
+// MixDiscovery fires the backend's POST /api/plugin/mix/discovery.
+// Synchronous part (existing-list) returns within seconds; missing-track
+// queueing happens in the backend's BackgroundTasks.
+func (c *Client) MixDiscovery(req MixDiscoveryRequest) (*MixDiscoveryResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal mix-discovery: %w", err)
+	}
+	out := &MixDiscoveryResponse{}
+	if err := c.request("POST", "/api/plugin/mix/discovery", body, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ---- LB Weekly Discovery -------------------------------------------------
+
+// LbWeeklyExistingTrack mirrors the entries in LbWeeklyDiscoveryResponse.Existing[].
+// SubsonicID is server-side-resolved so the build phase (runReconcile) doesn't
+// need an additional search3 call. Fields match the backend's existing[] items 1:1.
+type LbWeeklyExistingTrack struct {
+	SubsonicID string `json:"subsonic_id"`
+	Artist     string `json:"artist"`
+	Title      string `json:"title"`
+}
+
+// LbWeeklyDiscoveryRequest mirrors backend `PluginLbWeeklyDiscoveryRequest`.
+type LbWeeklyDiscoveryRequest struct {
+	NavidromeUser    string `json:"navidrome_user"`
+	ListenBrainzUser string `json:"listenbrainz_user"`
+	SourcePatch      string `json:"source_patch"`
+	Occurrence       int    `json:"occurrence"`
+	PlaylistName     string `json:"playlist_name"`
+}
+
+// LbWeeklyDiscoveryResponse is what /api/plugin/lbweekly/discovery returns:
+// the in-library "existing" tracks (synchronous), plus a flag that any
+// background processing has started.
+type LbWeeklyDiscoveryResponse struct {
+	Started  bool                    `json:"started"`
+	Existing []LbWeeklyExistingTrack `json:"existing"`
+}
+
+// LbWeeklyDiscovery fires the backend's POST /api/plugin/lbweekly/discovery.
+// Returns existing in-library tracks synchronously; backend may start background
+// tasks for missing tracks.
+func (c *Client) LbWeeklyDiscovery(req LbWeeklyDiscoveryRequest) (*LbWeeklyDiscoveryResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal lbweekly-discovery: %w", err)
+	}
+	out := &LbWeeklyDiscoveryResponse{}
+	if err := c.request("POST", "/api/plugin/lbweekly/discovery", body, out); err != nil {
 		return nil, err
 	}
 	return out, nil
