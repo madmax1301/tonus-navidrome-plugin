@@ -8,7 +8,7 @@
   "website": "https://github.com/madmax1301/tonus-navidrome-plugin",
   "permissions": {
     "http": {
-      "reason": "Calls the tonus backend (/api/plugin/health, /api/plugin/sync, /api/plugin/finished-tracks).",
+      "reason": "Calls the tonus backend (/api/plugin/health, /api/plugin/lbweekly/discovery, /api/plugin/finished-tracks).",
       "requiredHosts": ["*"]
     },
     "scheduler": {

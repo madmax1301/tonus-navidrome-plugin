@@ -1,32 +1,46 @@
 # tonus-navidrome-plugin
 
-A [Navidrome](https://www.navidrome.org/) plugin that triggers the [tonus](https://github.com/madmax1301/tonus) FastAPI backend on a schedule for **per-user music discovery + auto-download** — driven by each user's ListenBrainz history, surfaced as personal Subsonic playlists owned by their Navidrome account.
+A [Navidrome](https://www.navidrome.org/) plugin that mirrors your [ListenBrainz](https://listenbrainz.org/) **"Created For You"** playlists into Navidrome as personal, per-user playlists — and drives the [tonus](https://github.com/madmax1301/tonus) backend to download the tracks you don't own yet.
 
-**Status:** v0.3.0 — multi-user playlists are live. Single-schedule, daily by default. Multi-schedule + listen-tracking are on the v2 roadmap.
+**Status:** v0.5.0 — LB Weekly Mirror is the primary feature. Optional Genre Mixes on top. Multi-user from the ground up.
 
 ## What it does
 
-- Registers a recurring cron in Navidrome (default `0 7 * * *` — every day at 07:00 local time).
-- For each Navidrome user you map to a ListenBrainz account, on each cron tick:
-  1. Asks the tonus backend to discover "tracks you'd probably like" from that user's LB top-artists (Deezer artist-radio, filtered against their listening history) and queue them for download.
-  2. Reconciles already-finished tracks into a Subsonic playlist **owned by that Navidrome user**, named per template (default `Discovery {date}`, also supports `{user}`).
-- Idempotent — repeated cron ticks merge new finished tracks into the same dated playlist without creating duplicates. Tracks that take days to finish trickle into the playlist as they become available.
+### LB Weekly Mirror (primary)
+
+Every ListenBrainz user gets four auto-generated playlists — *Weekly Exploration*, *Weekly Jams*, *Last Week's Exploration*, *Last Week's Jams*. This plugin **mirrors all four into Navidrome** as playlists owned by the mapped Navidrome user, under the same names, and keeps them fresh:
+
+- Tracks you already have in your library are added to the Navidrome playlist immediately.
+- Tracks you don't have are queued in tonus for download and reconciled into the playlist as they finish (rate-limited downloads can trickle in over hours).
+- Each run **replaces the playlist in place** — same behaviour as ListenBrainz, the playlist just updates itself weekly. The playlist ID stays stable, so anything you copy out of it into your own playlists is unaffected.
+
+Enabled per user via the `lb_weekly_mirror` toggle (on by default).
+
+### Genre Mixes (optional)
+
+On top of the weekly mirror, each user can define any number of **Genre Mixes** — Spotify-style weekly playlists per genre (`metalcore`, `hip-hop`, `shoegaze`, …). Each mix has its own two-phase cron:
+
+- **Discovery** (default Wed 02:00) — fetches genre tracks from ListenBrainz, queues the missing ones for download.
+- **Build** (default Fri 06:00, 48 h later) — builds/replaces the Subsonic playlist from whatever finished downloading in the meantime.
+
+A `discovery_ratio` (default 0.4 = 40 % new / 60 % familiar) controls the new-vs-known mix. Same replace-in-place pattern — favourites you copy elsewhere are safe.
 
 ## What it does NOT do
 
-- The plugin does not download anything itself — that's tonus's job. The plugin is a thin trigger + Subsonic-playlist scheduler.
-- It does not show a live queue inside Navidrome — plugin UI is limited to the settings page. Use tonus's own web UI for live status (it has a status card under Settings).
-- It is single-schedule. Want different schedules for discovery vs cleanup vs maintenance? That's v2.
+- The plugin downloads nothing itself — that's tonus's job. It's a thin **trigger + Subsonic-playlist scheduler**.
+- No live queue inside Navidrome. The plugin UI is limited to its settings page; use tonus's own web UI for live download status.
+- No listen-tracking / scrobble ingestion — it reads ListenBrainz's *output* (the Created-For-You playlists), not your raw listens.
 
 ## Architecture (one paragraph)
 
-Plugin is a **thin trigger**: TaskQueue with concurrency 1 receives one trigger-task and one reconcile-task per Navidrome user per cron tick. The trigger-task fires `POST /api/plugin/sync` at tonus (fire-and-forget, returns in ms). The reconcile-task pulls `GET /api/plugin/finished-tracks` for the user and pushes results into a Subsonic playlist via `host.SubsonicAPICall("/rest/createPlaylist?u=USERNAME")` — Navidrome injects the user's auth automatically because the plugin has the `users` permission. The tonus backend resolves Subsonic track IDs server-side (admin-auth `search3`, cached in payload) so the plugin reconcile stays under the 30 s plugin-callback timeout.
+The plugin is a **thin trigger**; the backend is the brain. A TaskQueue with concurrency 1 receives, per Navidrome user per cron tick, one *discovery* task and one *reconcile* task per playlist slot. Discovery fires `POST /api/plugin/lbweekly/discovery` (or `/api/plugin/mix/discovery` for Genre Mixes) — tonus returns the in-library tracks synchronously and queues the missing ones for download in the background. Reconcile pulls `GET /api/plugin/finished-tracks` for the user, merges those with the persisted in-library IDs, and pushes the result into a Subsonic playlist via `host.SubsonicAPICall("/rest/createPlaylist?u=USERNAME")` — Navidrome injects the user's auth automatically because the plugin holds the `users` permission. tonus resolves Subsonic track IDs server-side (admin-auth `search3`, cached in the job payload) so the reconcile stays well under the 30 s plugin-callback timeout.
 
 ## Requirements
 
-- **Navidrome ≥ 0.60** (plugin system, Extism-based).
-- A reachable tonus backend exposing `/api/plugin/health`, `/api/plugin/sync`, `/api/plugin/sync-status`, `/api/plugin/finished-tracks`, plus the existing `/api/import/csv*` endpoints.
-- For build: [TinyGo](https://tinygo.org/getting-started/install/) `≥ 0.40` and [Go](https://golang.org/dl/) `≥ 1.23`. The Makefile falls back to plain `go` if TinyGo is missing, but the resulting WASM is much larger.
+- **Navidrome ≥ 0.60** (Extism-based plugin system).
+- A reachable **tonus** backend (≥ v0.6.1) exposing `/api/plugin/health`, `/api/plugin/lbweekly/discovery`, `/api/plugin/mix/discovery`, `/api/plugin/finished-tracks`, `/api/plugin/sync-status`.
+- A public **ListenBrainz** username per Navidrome user you want to mirror (the Created-For-You playlists must be publicly readable).
+- For building: [TinyGo](https://tinygo.org/getting-started/install/) `≥ 0.40` and [Go](https://golang.org/dl/) `≥ 1.23`. The Makefile falls back to plain `go` if TinyGo is missing, but the resulting WASM is much larger.
 
 ## Install
 
@@ -44,38 +58,39 @@ make package    # → tonus-navidrome-plugin.ndp
 
 ### Install into Navidrome
 
-1. In Navidrome admin → **Plugins** → upload `tonus-navidrome-plugin.ndp`.
+1. Copy `tonus-navidrome-plugin.ndp` into your Navidrome `plugins/` folder (or upload it via the admin **Plugins** page), then Rescan / restart.
 2. Enable the plugin. Required permissions:
-   - **HTTP** to your tonus host (manifest currently uses `"*"` — Navidrome may prompt you to confirm).
+   - **HTTP** to your tonus host (manifest uses `"*"` — Navidrome may prompt you to confirm).
    - **Scheduler** for the cron registration.
-   - **KVStore** for per-user status persistence.
-   - **SubsonicAPI** for playlist create/update.
-   - **Users** — flip on `Allow all users` or pick the users you want discovery for.
-   - **TaskQueue** for async per-user pipelines.
-3. Open the plugin's settings page and fill in:
-   - **Connection**: `tonus_url` (e.g. `http://192.168.1.200:8000`) and `tonus_token` (the `TONUS_API_TOKEN` from your tonus `.env`, optional).
-   - **Schedule + Global Discovery Tuning**: cron expression (default `0 7 * * *`), top-N artists, tracks-per-artist, max queue per run.
-   - **Users**: click `+` for each Navidrome user. Per entry set `navidrome_username`, `listenbrainz_username`, and the `playlist_name` template (`Discovery {date}` or `Discovery {user} {date}`).
+   - **KVStore** for per-user status + in-library-track persistence.
+   - **SubsonicAPI** for playlist create/replace.
+   - **Users** — flip on `Allow all users`, or pick the users you want mirrored.
+   - **TaskQueue** for the async per-user pipelines.
+3. Open the plugin settings and fill in:
+   - **Connection**: `tonus_url` (e.g. `http://192.168.1.200:8000`) and `tonus_token` (a tonus **PAT** or the legacy `TONUS_API_TOKEN`; leave empty if tonus runs tokenless).
+   - **Schedule**: the global `cron_expression` for the weekly mirror (default `0 7 * * *`).
+   - **Users**: click `+` per Navidrome user, set `navidrome_username` + `listenbrainz_username`, leave `lb_weekly_mirror` on, and optionally add one or more `mixes`.
 
 ## How it works under the hood
 
-1. **OnInit** registers the cron with `host.SchedulerScheduleRecurring(cron, ...)` and creates the TaskQueue with `host.TaskCreateQueue(...)`.
-2. **OnCallback** (cron tick) reads the user-mapping array and enqueues — for each user — one trigger-task and one reconcile-task. Returns in <1 s.
-3. **OnTaskExecute** (one of the two task types):
-   - `trigger-sync`: health-check + `POST /api/plugin/sync` with the user-specific config. Backend kicks off discovery + download asynchronously.
-   - `reconcile`: `GET /api/plugin/finished-tracks?navidrome_user=...&limit=25` returns finished tracks **with backend-resolved Subsonic IDs**. Plugin opens a Subsonic client bound to the Navidrome user (via `host.SubsonicAPICall`) and `findOrCreate` + `addTracksIdempotent` against the playlist.
-4. **Status**: per-user state is persisted in `KVStore` under `status:<navidrome_user>`. The tonus web UI also shows a global status card.
+1. **OnInit** registers the global cron with `host.SchedulerScheduleRecurring(...)`, plus one discovery- and one build-cron per configured Genre Mix, and creates the TaskQueue.
+2. **OnCallback** (cron tick) reads the user-mapping array and enqueues the relevant tasks — for the weekly mirror, a discovery + reconcile pair for each of the four LB slots per user. Returns in under a second.
+3. **OnTaskExecute** runs one task:
+   - `lbweekly-discovery` / `mix-discovery`: health-check + discovery POST. tonus returns the in-library tracks (persisted to `KVStore`) and queues missing tracks for download.
+   - `reconcile` / `mix-build`: `GET /api/plugin/finished-tracks`, merge with the persisted in-library IDs, dedupe, and `findOrCreate` + replace the Subsonic playlist.
+4. **Status**: per-user state (timestamps, counts, last error) is persisted in `KVStore`. tonus's web UI also shows a global status card.
 
 ## Cold-start note
 
-The first time the plugin runs for a fresh Navidrome user, you may see one "Task execution failed: module closed with context deadline exceeded" warning — that's Navidrome registering a new player context for that user the first time the plugin authenticates as them. The retry (built into the TaskQueue with `MaxRetries=3, BackoffMs=30000`) succeeds in seconds. After 1–2 successful reconciles the cold start is over and tasks complete instantly.
+The first time the plugin authenticates as a fresh Navidrome user you may see one `module closed with context deadline exceeded` warning — that's Navidrome registering a new player context for that user. The built-in TaskQueue retry (`MaxRetries=3, BackoffMs=30000`) succeeds within seconds. After 1–2 successful reconciles the cold start is over.
 
 ## Architecture decisions worth knowing
 
-- **Plugin = trigger, backend = brain.** All discovery + download stay in tonus where they're easy to debug. Plugin only knows three tonus endpoints + Subsonic.
-- **Reconcile pattern, not polling.** Tracks queued today might not finish for hours or days (rate-limited downloads). Each cron tick the reconcile runs again, idempotently picks up newly finished tracks, never duplicates.
-- **Subsonic IDs cached in `download_jobs.payload_json`.** Resolves the slow `search3` once per track (admin-auth, server-side) and never again.
-- **Per-user playlist ownership** via `host.SubsonicAPICall("?u=USERNAME")`. No user passwords stored in the plugin or backend — Navidrome injects auth based on the plugin's `users` permission.
+- **Plugin = trigger, backend = brain.** All discovery + download stay in tonus where they're easy to debug. The plugin knows only a handful of tonus endpoints + Subsonic.
+- **Reconcile pattern, not polling.** Tracks queued today may not finish for hours. Each run reconciles again, idempotently picking up newly finished tracks, never duplicating.
+- **In-library IDs persisted in KVStore.** The reconcile merges tracks you already own (returned by discovery) with freshly downloaded ones — so a mirror is complete even when nothing new had to be downloaded.
+- **Per-user playlist ownership** via `host.SubsonicAPICall("?u=USERNAME")`. No user passwords stored anywhere — Navidrome injects auth from the plugin's `users` permission.
+- **ListenBrainz `createdfor` returns metadata only.** The actual tracks live behind `/playlist/<mbid>`; tonus does the two-step fetch server-side so the plugin never sees the LB API directly.
 
 ## License
 
