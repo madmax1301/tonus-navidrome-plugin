@@ -3,12 +3,12 @@
   "$id": "navidrome://plugins/manifest/tonus-sync",
   "name": "tonus-sync",
   "author": "madmax1301",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Triggers tonus (FastAPI backend) on a schedule for automatic sync per Navidrome user. Each configured user gets LB Weekly Mirror (four 'Created For You' ListenBrainz playlists kept in sync) plus optional Genre Mixes — weekly Spotify-style playlists per genre with configurable Wed/Fri discovery+build cycle. Genre Mixes use a fixed playlist (replace pattern) so users can copy favorites into their own playlists.",
   "website": "https://github.com/madmax1301/tonus-navidrome-plugin",
   "permissions": {
     "http": {
-      "reason": "Calls the tonus backend (/api/plugin/health, /api/plugin/lbweekly/discovery, /api/plugin/finished-tracks).",
+      "reason": "Calls the tonus backend (/api/plugin/health, /api/plugin/lbweekly/discovery, /api/plugin/lbfresh/discovery, /api/plugin/finished-tracks).",
       "requiredHosts": ["*"]
     },
     "scheduler": {
@@ -74,6 +74,17 @@
                 "title": "LB Weekly Mirror",
                 "description": "Spiegelt die vier ListenBrainz 'Created For You'-Playlists (Weekly/Last Week's Exploration + Jams) als Navidrome-Playlists dieses Users und hält sie aktuell.",
                 "default": true
+              },
+              "lb_fresh_releases": {
+                "type": "boolean",
+                "title": "Fresh Releases",
+                "description": "Baut eine Playlist 'Fresh Releases' aus den persönlichen ListenBrainz-Fresh-Releases der letzten 7 Tage (pro Release die populärsten zwei Tracks). Läuft mit dem globalen Cron.",
+                "default": false
+              },
+              "listenbrainz_token": {
+                "type": "string",
+                "title": "ListenBrainz Token",
+                "description": "Optional: User-Token von listenbrainz.org/settings. Wird für Fresh Releases mitgeschickt, falls ListenBrainz ihn verlangt."
               },
               "mixes": {
                 "type": "array",
@@ -226,6 +237,8 @@
                     { "type": "Control", "scope": "#/properties/navidrome_username" },
                     { "type": "Control", "scope": "#/properties/listenbrainz_username" },
                     { "type": "Control", "scope": "#/properties/lb_weekly_mirror" },
+                    { "type": "Control", "scope": "#/properties/lb_fresh_releases" },
+                    { "type": "Control", "scope": "#/properties/listenbrainz_token" },
                     {
                       "type": "Control",
                       "scope": "#/properties/mixes",

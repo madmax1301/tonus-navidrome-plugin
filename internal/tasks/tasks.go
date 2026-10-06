@@ -15,6 +15,9 @@
 //   - JobLbWeeklyDiscovery → POST /api/plugin/lbweekly/discovery for one (user,
 //                            slot) — gets the in-library "existing" list back,
 //                            persists it in KVStore; build phase reuses runReconcile
+//   - JobLbFreshDiscovery  → POST /api/plugin/lbfresh/discovery for one user —
+//                            same flow as lbweekly, source is the user's LB
+//                            Fresh Releases
 //
 // All jobs run in the same TaskQueue (concurrency 1) so per-user runs never
 // overlap and Subsonic playlist updates are well-ordered.
@@ -44,7 +47,11 @@ const (
 	JobMixDiscovery      JobType = "mix-discovery"
 	JobMixBuild          JobType = "mix-build"
 	JobLbWeeklyDiscovery JobType = "lbweekly-discovery"
+	JobLbFreshDiscovery  JobType = "lbfresh-discovery"
 )
+
+// LbFreshPlaylistName is the Navidrome-side name of the Fresh Releases playlist.
+const LbFreshPlaylistName = "Fresh Releases"
 
 // LbWeeklySlot describes one of the four mirrored LB playlists.
 type LbWeeklySlot struct {
@@ -85,6 +92,9 @@ type Job struct {
 	// LB-Weekly-specific (used by JobLbWeeklyDiscovery).
 	LbSourcePatch string `json:"lb_source_patch,omitempty"`
 	LbOccurrence  int    `json:"lb_occurrence,omitempty"`
+
+	// LB-Fresh-specific (used by JobLbFreshDiscovery). Optional.
+	LbToken string `json:"lb_token,omitempty"`
 }
 
 // Marshal returns the task payload bytes for host.TaskEnqueue.
@@ -107,6 +117,8 @@ func (j *Job) Dispatch() (string, error) {
 		return runMixBuild(j)
 	case JobLbWeeklyDiscovery:
 		return runLbWeeklyDiscovery(j)
+	case JobLbFreshDiscovery:
+		return runLbFreshDiscovery(j)
 	default:
 		return fmt.Sprintf("unknown job type %q", j.Type), nil
 	}

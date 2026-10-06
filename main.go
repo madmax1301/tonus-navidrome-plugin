@@ -71,6 +71,8 @@ type userMapping struct {
 	ListenBrainzUsername string      `json:"listenbrainz_username"`
 	Mixes                []mixConfig `json:"mixes,omitempty"`
 	LbWeeklyMirror       bool        `json:"lb_weekly_mirror"`
+	LbFreshReleases      bool        `json:"lb_fresh_releases"`
+	ListenBrainzToken    string      `json:"listenbrainz_token,omitempty"`
 }
 
 func loadUsers() ([]userMapping, error) {
@@ -239,28 +241,42 @@ func (p *plugin) OnCallback(req scheduler.SchedulerCallbackRequest) error {
 	enqueuedReconcile := 0
 
 	for _, u := range users {
-		if u.NavidromeUsername == "" || !u.LbWeeklyMirror {
+		if u.NavidromeUsername == "" {
 			continue
 		}
-		for _, slot := range tasks.LbWeeklySlots {
-			base := tasks.Job{
-				NavidromeUser:    u.NavidromeUsername,
-				ListenBrainzUser: u.ListenBrainzUsername,
-				PlaylistName:     slot.PlaylistName,
-				LbSourcePatch:    slot.SourcePatch,
-				LbOccurrence:     slot.Occurrence,
-				TonusURL:         tonusURL,
-				TonusToken:       tonusToken,
+		// One (discovery, reconcile) pair per mirrored playlist.
+		var jobs []tasks.Job
+		if u.LbWeeklyMirror {
+			for _, slot := range tasks.LbWeeklySlots {
+				jobs = append(jobs, tasks.Job{
+					Type:          tasks.JobLbWeeklyDiscovery,
+					PlaylistName:  slot.PlaylistName,
+					LbSourcePatch: slot.SourcePatch,
+					LbOccurrence:  slot.Occurrence,
+				})
 			}
+		}
+		if u.LbFreshReleases {
+			jobs = append(jobs, tasks.Job{
+				Type:         tasks.JobLbFreshDiscovery,
+				PlaylistName: tasks.LbFreshPlaylistName,
+				LbToken:      u.ListenBrainzToken,
+			})
+		}
 
-			// 1) Discovery → backend queues missing LB-Weekly tracks for download.
+		for _, base := range jobs {
+			base.NavidromeUser = u.NavidromeUsername
+			base.ListenBrainzUser = u.ListenBrainzUsername
+			base.TonusURL = tonusURL
+			base.TonusToken = tonusToken
+
+			// 1) Discovery → backend queues missing tracks for download.
 			disc := base
-			disc.Type = tasks.JobLbWeeklyDiscovery
 			if payload, err := disc.Marshal(); err == nil {
 				if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
 					pdk.Log(pdk.LogError, fmt.Sprintf(
-						"enqueue lbweekly-discovery %q/%q: %s",
-						u.NavidromeUsername, slot.PlaylistName, err.Error(),
+						"enqueue %s %q/%q: %s",
+						disc.Type, u.NavidromeUsername, base.PlaylistName, err.Error(),
 					))
 				} else {
 					enqueuedDiscovery++
@@ -275,7 +291,7 @@ func (p *plugin) OnCallback(req scheduler.SchedulerCallbackRequest) error {
 				if _, err := host.TaskEnqueue(tasks.QueueName, payload); err != nil {
 					pdk.Log(pdk.LogError, fmt.Sprintf(
 						"enqueue reconcile %q/%q: %s",
-						u.NavidromeUsername, slot.PlaylistName, err.Error(),
+						u.NavidromeUsername, base.PlaylistName, err.Error(),
 					))
 				} else {
 					enqueuedReconcile++
@@ -285,7 +301,7 @@ func (p *plugin) OnCallback(req scheduler.SchedulerCallbackRequest) error {
 	}
 
 	pdk.Log(pdk.LogInfo, fmt.Sprintf(
-		"tonus-sync: enqueued %d lbweekly-discovery + %d reconcile tasks (users=%d)",
+		"tonus-sync: enqueued %d discovery + %d reconcile tasks (users=%d)",
 		enqueuedDiscovery, enqueuedReconcile, len(users),
 	))
 	return nil
