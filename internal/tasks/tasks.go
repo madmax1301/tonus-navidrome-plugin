@@ -95,6 +95,12 @@ type Job struct {
 
 	// LB-Fresh-specific (used by JobLbFreshDiscovery). Optional.
 	LbToken string `json:"lb_token,omitempty"`
+
+	// ReplaceWindowDays > 0 makes runReconcile replace the playlist content
+	// with the current in-library list plus tracks finished within that many
+	// days, instead of only appending. Old entries drop out of the playlist;
+	// the songs stay in the library.
+	ReplaceWindowDays int `json:"replace_window_days,omitempty"`
 }
 
 // Marshal returns the task payload bytes for host.TaskEnqueue.
@@ -165,7 +171,11 @@ func runReconcile(j *Job) (string, error) {
 	// 1. Pull a small batch of finished tracks (limit=25 keeps backend
 	// search3-resolution + plugin Subsonic-write under the 30s task timeout).
 	// Remaining tracks come along on subsequent cron triggers.
-	finished, err := cl.FinishedTracks(j.NavidromeUser, 60, j.PlaylistName)
+	sinceDays := 60
+	if j.ReplaceWindowDays > 0 {
+		sinceDays = j.ReplaceWindowDays
+	}
+	finished, err := cl.FinishedTracks(j.NavidromeUser, sinceDays, j.PlaylistName)
 	if err != nil {
 		return "", fmt.Errorf("reconcile %q: finished-tracks: %w", j.NavidromeUser, err)
 	}
@@ -237,9 +247,20 @@ func runReconcile(j *Job) (string, error) {
 		songIDs = append(songIDs, sid)
 	}
 
-	added, err := sub.AddTracksIdempotent(pl, songIDs)
-	if err != nil {
-		return "", fmt.Errorf("reconcile %q: add tracks: %w", j.NavidromeUser, err)
+	var added int
+	if j.ReplaceWindowDays > 0 {
+		if len(songIDs) == 0 {
+			return "", nil
+		}
+		if err := sub.ReplaceTracks(pl, songIDs); err != nil {
+			return "", fmt.Errorf("reconcile %q: replace tracks: %w", j.NavidromeUser, err)
+		}
+		added = len(songIDs)
+	} else {
+		added, err = sub.AddTracksIdempotent(pl, songIDs)
+		if err != nil {
+			return "", fmt.Errorf("reconcile %q: add tracks: %w", j.NavidromeUser, err)
+		}
 	}
 
 	pdk.Log(pdk.LogInfo, fmt.Sprintf(

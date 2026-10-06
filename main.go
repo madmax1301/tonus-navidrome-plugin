@@ -261,6 +261,9 @@ func (p *plugin) OnCallback(req scheduler.SchedulerCallbackRequest) error {
 				Type:         tasks.JobLbFreshDiscovery,
 				PlaylistName: tasks.LbFreshPlaylistName,
 				LbToken:      u.ListenBrainzToken,
+				// Rolling 7-day window, matching the backend's days=7:
+				// older releases drop out of the playlist.
+				ReplaceWindowDays: 7,
 			})
 		}
 
