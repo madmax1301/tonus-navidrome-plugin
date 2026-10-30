@@ -2,7 +2,7 @@
 
 A [Navidrome](https://www.navidrome.org/) plugin that mirrors your [ListenBrainz](https://listenbrainz.org/) **"Created For You"** playlists into Navidrome as personal, per-user playlists — and drives the [tonus](https://github.com/madmax1301/tonus) backend to download the tracks you don't own yet.
 
-**Status:** v0.5.0 — LB Weekly Mirror is the primary feature. Optional Genre Mixes on top. Multi-user from the ground up.
+**Status:** v0.6.0 — LB Weekly Mirror is the primary feature. Optional Fresh Releases and Genre Mixes on top. Multi-user from the ground up.
 
 ## What it does
 
@@ -15,6 +15,12 @@ Every ListenBrainz user gets four auto-generated playlists — *Weekly Explorati
 - Each run **replaces the playlist in place** — same behaviour as ListenBrainz, the playlist just updates itself weekly. The playlist ID stays stable, so anything you copy out of it into your own playlists is unaffected.
 
 Enabled per user via the `lb_weekly_mirror` toggle (on by default).
+
+### Fresh Releases (optional)
+
+A *Fresh Releases* playlist per user, built from that user's personal [ListenBrainz Fresh Releases](https://listenbrainz.readthedocs.io/en/latest/users/api/misc.html) (releases from the last 7 days by artists you listen to). tonus takes the two most popular tracks per release, skips compilations and live albums, and the same discovery → download → reconcile path as the Weekly Mirror fills the playlist. Runs on the global cron. Unlike the other playlists, each run **replaces** the playlist content with the current 7-day window, so older releases drop out of the playlist while the songs stay in your library.
+
+Enabled per user via the `lb_fresh_releases` toggle (off by default). `listenbrainz_token` is optional and is only sent along if set. Requires tonus with `POST /api/plugin/lbfresh/discovery`.
 
 ### Genre Mixes (optional)
 

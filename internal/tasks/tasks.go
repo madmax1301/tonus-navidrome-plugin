@@ -15,6 +15,9 @@
 //   - JobLbWeeklyDiscovery → POST /api/plugin/lbweekly/discovery for one (user,
 //                            slot) — gets the in-library "existing" list back,
 //                            persists it in KVStore; build phase reuses runReconcile
+//   - JobLbFreshDiscovery  → POST /api/plugin/lbfresh/discovery for one user —
+//                            same flow as lbweekly, source is the user's LB
+//                            Fresh Releases
 //
 // All jobs run in the same TaskQueue (concurrency 1) so per-user runs never
 // overlap and Subsonic playlist updates are well-ordered.
@@ -44,7 +47,11 @@ const (
 	JobMixDiscovery      JobType = "mix-discovery"
 	JobMixBuild          JobType = "mix-build"
 	JobLbWeeklyDiscovery JobType = "lbweekly-discovery"
+	JobLbFreshDiscovery  JobType = "lbfresh-discovery"
 )
+
+// LbFreshPlaylistName is the Navidrome-side name of the Fresh Releases playlist.
+const LbFreshPlaylistName = "Fresh Releases"
 
 // LbWeeklySlot describes one of the four mirrored LB playlists.
 type LbWeeklySlot struct {
@@ -85,6 +92,15 @@ type Job struct {
 	// LB-Weekly-specific (used by JobLbWeeklyDiscovery).
 	LbSourcePatch string `json:"lb_source_patch,omitempty"`
 	LbOccurrence  int    `json:"lb_occurrence,omitempty"`
+
+	// LB-Fresh-specific (used by JobLbFreshDiscovery). Optional.
+	LbToken string `json:"lb_token,omitempty"`
+
+	// ReplaceWindowDays > 0 makes runReconcile replace the playlist content
+	// with the current in-library list plus tracks finished within that many
+	// days, instead of only appending. Old entries drop out of the playlist;
+	// the songs stay in the library.
+	ReplaceWindowDays int `json:"replace_window_days,omitempty"`
 }
 
 // Marshal returns the task payload bytes for host.TaskEnqueue.
@@ -107,6 +123,8 @@ func (j *Job) Dispatch() (string, error) {
 		return runMixBuild(j)
 	case JobLbWeeklyDiscovery:
 		return runLbWeeklyDiscovery(j)
+	case JobLbFreshDiscovery:
+		return runLbFreshDiscovery(j)
 	default:
 		return fmt.Sprintf("unknown job type %q", j.Type), nil
 	}
@@ -153,7 +171,11 @@ func runReconcile(j *Job) (string, error) {
 	// 1. Pull a small batch of finished tracks (limit=25 keeps backend
 	// search3-resolution + plugin Subsonic-write under the 30s task timeout).
 	// Remaining tracks come along on subsequent cron triggers.
-	finished, err := cl.FinishedTracks(j.NavidromeUser, 60, j.PlaylistName)
+	sinceDays := 60
+	if j.ReplaceWindowDays > 0 {
+		sinceDays = j.ReplaceWindowDays
+	}
+	finished, err := cl.FinishedTracks(j.NavidromeUser, sinceDays, j.PlaylistName)
 	if err != nil {
 		return "", fmt.Errorf("reconcile %q: finished-tracks: %w", j.NavidromeUser, err)
 	}
@@ -225,9 +247,20 @@ func runReconcile(j *Job) (string, error) {
 		songIDs = append(songIDs, sid)
 	}
 
-	added, err := sub.AddTracksIdempotent(pl, songIDs)
-	if err != nil {
-		return "", fmt.Errorf("reconcile %q: add tracks: %w", j.NavidromeUser, err)
+	var added int
+	if j.ReplaceWindowDays > 0 {
+		if len(songIDs) == 0 {
+			return "", nil
+		}
+		if err := sub.ReplaceTracks(pl, songIDs); err != nil {
+			return "", fmt.Errorf("reconcile %q: replace tracks: %w", j.NavidromeUser, err)
+		}
+		added = len(songIDs)
+	} else {
+		added, err = sub.AddTracksIdempotent(pl, songIDs)
+		if err != nil {
+			return "", fmt.Errorf("reconcile %q: add tracks: %w", j.NavidromeUser, err)
+		}
 	}
 
 	pdk.Log(pdk.LogInfo, fmt.Sprintf(

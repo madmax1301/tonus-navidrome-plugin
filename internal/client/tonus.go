@@ -438,3 +438,27 @@ func (c *Client) LbWeeklyDiscovery(req LbWeeklyDiscoveryRequest) (*LbWeeklyDisco
 	}
 	return out, nil
 }
+
+// LbFreshDiscoveryRequest mirrors backend `PluginLbFreshDiscoveryRequest`.
+// Backend defaults apply for days/max_releases/tracks_per_release.
+type LbFreshDiscoveryRequest struct {
+	NavidromeUser     string `json:"navidrome_user"`
+	ListenBrainzUser  string `json:"listenbrainz_user"`
+	ListenBrainzToken string `json:"listenbrainz_token,omitempty"`
+	PlaylistName      string `json:"playlist_name"`
+}
+
+// LbFreshDiscovery fires the backend's POST /api/plugin/lbfresh/discovery.
+// Same response shape as LbWeeklyDiscovery: in-library tracks synchronously,
+// missing ones are queued in the background.
+func (c *Client) LbFreshDiscovery(req LbFreshDiscoveryRequest) (*LbWeeklyDiscoveryResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal lbfresh-discovery: %w", err)
+	}
+	out := &LbWeeklyDiscoveryResponse{}
+	if err := c.request("POST", "/api/plugin/lbfresh/discovery", body, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
