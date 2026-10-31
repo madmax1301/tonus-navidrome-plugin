@@ -3,7 +3,7 @@
   "$id": "navidrome://plugins/manifest/tonus-sync",
   "name": "tonus-sync",
   "author": "madmax1301",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Triggers tonus (FastAPI backend) on a schedule for automatic sync per Navidrome user. Each configured user gets LB Weekly Mirror (four 'Created For You' ListenBrainz playlists kept in sync) plus optional Genre Mixes — weekly Spotify-style playlists per genre with configurable Wed/Fri discovery+build cycle. Genre Mixes use a fixed playlist (replace pattern) so users can copy favorites into their own playlists.",
   "website": "https://github.com/madmax1301/tonus-navidrome-plugin",
   "permissions": {
