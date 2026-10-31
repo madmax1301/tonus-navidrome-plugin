@@ -171,11 +171,28 @@ func runReconcile(j *Job) (string, error) {
 	// 1. Pull a small batch of finished tracks (limit=25 keeps backend
 	// search3-resolution + plugin Subsonic-write under the 30s task timeout).
 	// Remaining tracks come along on subsequent cron triggers.
+	//
+	// Replace mode: the playlist is rebuilt from scratch each run, so we need
+	// the whole current set (limit 200) instead of a 25-track batch.
+	//   - Fresh Releases: rolling ReplaceWindowDays window.
+	//   - LB-Weekly slots: everything queued since the last LB rotation. The
+	//     rotation time comes from the discovery; without it (older tonus)
+	//     we stay in append mode.
 	sinceDays := 60
+	var sinceMs int64
+	limit := 0
+	replace := false
 	if j.ReplaceWindowDays > 0 {
 		sinceDays = j.ReplaceWindowDays
+		limit = 200
+		replace = true
+	} else if j.LbSourcePatch != "" {
+		if sinceMs = readLbWeeklyRotated(j.NavidromeUser, j.PlaylistName); sinceMs > 0 {
+			limit = 200
+			replace = true
+		}
 	}
-	finished, err := cl.FinishedTracks(j.NavidromeUser, sinceDays, j.PlaylistName)
+	finished, err := cl.FinishedTracks(j.NavidromeUser, sinceDays, j.PlaylistName, sinceMs, limit)
 	if err != nil {
 		return "", fmt.Errorf("reconcile %q: finished-tracks: %w", j.NavidromeUser, err)
 	}
@@ -248,7 +265,7 @@ func runReconcile(j *Job) (string, error) {
 	}
 
 	var added int
-	if j.ReplaceWindowDays > 0 {
+	if replace {
 		if len(songIDs) == 0 {
 			return "", nil
 		}
