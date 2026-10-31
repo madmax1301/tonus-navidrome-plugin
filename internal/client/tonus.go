@@ -309,7 +309,10 @@ func (c *Client) Download(trackID string, hint TrackHint, location string) Downl
 //
 // playlistName is optional — when set, only tracks tagged with that playlist
 // are returned (useful when reconciling a single specific playlist).
-func (c *Client) FinishedTracks(navidromeUser string, sinceDays int, playlistName string) (*FinishedTracksResponse, error) {
+// sinceMs > 0 additionally drops tracks queued before that moment (needs
+// tonus with the since_ms filter; older backends ignore it). limit <= 0 keeps
+// the backend default of 25.
+func (c *Client) FinishedTracks(navidromeUser string, sinceDays int, playlistName string, sinceMs int64, limit int) (*FinishedTracksResponse, error) {
 	if sinceDays <= 0 {
 		sinceDays = 60
 	}
@@ -318,6 +321,12 @@ func (c *Client) FinishedTracks(navidromeUser string, sinceDays int, playlistNam
 	q.Set("since_days", fmt.Sprintf("%d", sinceDays))
 	if playlistName != "" {
 		q.Set("playlist_name", playlistName)
+	}
+	if sinceMs > 0 {
+		q.Set("since_ms", fmt.Sprintf("%d", sinceMs))
+	}
+	if limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
 	}
 	out := &FinishedTracksResponse{}
 	if err := c.request("GET", "/api/plugin/finished-tracks?"+q.Encode(), nil, out); err != nil {
@@ -418,10 +427,13 @@ type LbWeeklyDiscoveryRequest struct {
 
 // LbWeeklyDiscoveryResponse is what /api/plugin/lbweekly/discovery returns:
 // the in-library "existing" tracks (synchronous), plus a flag that any
-// background processing has started.
+// background processing has started. RotatedAtMs is the date of the newest
+// LB playlist for the source_patch (0 = unknown or older tonus): tracks
+// queued for this playlist before it belong to an older LB week.
 type LbWeeklyDiscoveryResponse struct {
-	Started  bool                    `json:"started"`
-	Existing []LbWeeklyExistingTrack `json:"existing"`
+	Started     bool                    `json:"started"`
+	Existing    []LbWeeklyExistingTrack `json:"existing"`
+	RotatedAtMs int64                   `json:"rotated_at_ms"`
 }
 
 // LbWeeklyDiscovery fires the backend's POST /api/plugin/lbweekly/discovery.
